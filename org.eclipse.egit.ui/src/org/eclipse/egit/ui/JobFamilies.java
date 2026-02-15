@@ -17,7 +17,8 @@ import org.eclipse.ui.progress.IProgressService;
 
 /**
  * Job families of EGit jobs. May be used in tests to join job execution.
- *
+ * Provides constants for different job types such as history generation,
+ * push, pull, fetch, and index diff operations.
  */
 public class JobFamilies {
 
