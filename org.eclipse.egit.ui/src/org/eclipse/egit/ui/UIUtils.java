@@ -103,7 +103,8 @@ import org.eclipse.ui.keys.IBindingService;
 import org.eclipse.ui.services.IServiceLocator;
 
 /**
- * Some utilities for UI code
+ * Utility class containing helper methods for UI components.
+ * Provides methods for dialogs, content assist, decorations, and widget management.
  */
 public class UIUtils {
 

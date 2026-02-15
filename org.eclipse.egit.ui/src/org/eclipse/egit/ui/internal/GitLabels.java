@@ -30,7 +30,8 @@ import org.eclipse.jgit.lib.RepositoryState;
 import org.eclipse.osgi.util.NLS;
 
 /**
- * Various methods to compute label for different Git repository elements.
+ * Utility class providing various methods to compute labels and descriptions
+ * for different Git repository elements such as refs, branches, and repositories.
  */
 public class GitLabels {
 	private GitLabels() {
