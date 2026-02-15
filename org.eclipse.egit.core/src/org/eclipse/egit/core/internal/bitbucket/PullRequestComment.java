@@ -54,6 +54,12 @@ public class PullRequestComment {
 	private List<PullRequestComment> replies = new ArrayList<>();
 
 	/**
+	 * ID of the parent comment this comment replies to. Used by GitHub for
+	 * thread reconstruction. Value is -1 for root comments (not a reply).
+	 */
+	private long inReplyToId = -1;
+
+	/**
 	 * @return the comment ID
 	 */
 	public long getId() {
@@ -291,6 +297,22 @@ public class PullRequestComment {
 	 */
 	public void setReplies(List<PullRequestComment> replies) {
 		this.replies = replies;
+	}
+
+	/**
+	 * @return the ID of the parent comment this replies to, or -1 if this is a
+	 *         root comment
+	 */
+	public long getInReplyToId() {
+		return inReplyToId;
+	}
+
+	/**
+	 * @param inReplyToId
+	 *            the ID of the parent comment
+	 */
+	public void setInReplyToId(long inReplyToId) {
+		this.inReplyToId = inReplyToId;
 	}
 
 	/**

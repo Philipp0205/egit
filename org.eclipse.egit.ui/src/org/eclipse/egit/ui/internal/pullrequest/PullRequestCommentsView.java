@@ -19,11 +19,11 @@ import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.jobs.Job;
-import org.eclipse.egit.core.internal.bitbucket.BitbucketClient;
 import org.eclipse.egit.core.internal.bitbucket.PullRequest;
 import org.eclipse.egit.core.internal.bitbucket.PullRequestComment;
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
+import org.eclipse.egit.core.internal.pullrequest.PullRequestClientFactory;
 import org.eclipse.egit.ui.Activator;
-import org.eclipse.egit.ui.UIPreferences;
 import org.eclipse.egit.ui.internal.PreferenceBasedDateFormatter;
 import org.eclipse.jface.action.Action;
 import org.eclipse.jface.action.IAction;
@@ -31,10 +31,12 @@ import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.MenuManager;
 import org.eclipse.jface.action.Separator;
-import org.eclipse.jface.dialogs.Dialog;
 import org.eclipse.jface.layout.GridDataFactory;
 import org.eclipse.jface.layout.GridLayoutFactory;
 import org.eclipse.jface.layout.TreeColumnLayout;
+import org.eclipse.jface.preference.IPreferenceStore;
+import org.eclipse.jface.preference.PreferenceConverter;
+import org.eclipse.jface.util.IPropertyChangeListener;
 import org.eclipse.jface.viewers.ColumnLabelProvider;
 import org.eclipse.jface.viewers.ColumnViewerToolTipSupport;
 import org.eclipse.jface.viewers.ColumnWeightData;
@@ -53,23 +55,24 @@ import org.eclipse.swt.custom.StyledText;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Font;
 import org.eclipse.swt.graphics.FontData;
+import org.eclipse.swt.graphics.RGB;
 import org.eclipse.swt.widgets.Button;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
-import org.eclipse.swt.widgets.Label;
 import org.eclipse.swt.widgets.Menu;
 import org.eclipse.swt.widgets.Shell;
-import org.eclipse.swt.widgets.Text;
 import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.IEditorPart;
 import org.eclipse.ui.IEditorReference;
 import org.eclipse.ui.ISelectionListener;
 import org.eclipse.ui.IWorkbenchPage;
 import org.eclipse.ui.IWorkbenchPart;
+import org.eclipse.ui.editors.text.EditorsUI;
 import org.eclipse.ui.forms.widgets.Form;
 import org.eclipse.ui.forms.widgets.FormToolkit;
 import org.eclipse.ui.part.ViewPart;
+import org.eclipse.ui.texteditor.AbstractTextEditor;
 
 /**
  * View for displaying comments on pull request files. Supports showing comments
@@ -123,6 +126,8 @@ public class PullRequestCommentsView extends ViewPart {
 
 	private Color highlightColor;
 
+	private IPropertyChangeListener editorPropertyChangeListener;
+
 	// Fields for tracking collapsed comment threads
 	private java.util.Set<Long> collapsedCommentIds = new java.util.HashSet<>();
 
@@ -134,13 +139,25 @@ public class PullRequestCommentsView extends ViewPart {
 		toolkit = new FormToolkit(parent.getDisplay());
 		parent.addDisposeListener(e -> toolkit.dispose());
 
-		// Create highlight color (light yellow/amber)
-		highlightColor = new Color(parent.getDisplay(), 255, 255, 180);
+		// Initialize highlight color from Eclipse editor selection preference
+		updateHighlightColor();
 		parent.addDisposeListener(e -> {
 			if (highlightColor != null && !highlightColor.isDisposed()) {
 				highlightColor.dispose();
 			}
 		});
+
+		// Listen for changes to editor selection background color preference
+		editorPropertyChangeListener = event -> {
+			if (AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND
+					.equals(event.getProperty())
+					|| AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND_SYSTEM_DEFAULT
+							.equals(event.getProperty())) {
+				updateHighlightColor();
+			}
+		};
+		EditorsUI.getPreferenceStore()
+				.addPropertyChangeListener(editorPropertyChangeListener);
 
 		form = toolkit.createForm(parent);
 		form.setText("Comments"); //$NON-NLS-1$
@@ -154,9 +171,10 @@ public class PullRequestCommentsView extends ViewPart {
 		// SashForm: top = comment tree, bottom = detail panel
 		sashForm = new SashForm(form.getBody(), SWT.VERTICAL);
 		GridDataFactory.fillDefaults().grab(true, true).applyTo(sashForm);
+		toolkit.adapt(sashForm);
 
 		// Top part: tree viewer with columns
-		Composite treeComposite = new Composite(sashForm, SWT.NONE);
+		Composite treeComposite = toolkit.createComposite(sashForm);
 		TreeColumnLayout treeColumnLayout = new TreeColumnLayout();
 		treeComposite.setLayout(treeColumnLayout);
 
@@ -164,6 +182,8 @@ public class PullRequestCommentsView extends ViewPart {
 				SWT.BORDER | SWT.FULL_SELECTION | SWT.V_SCROLL);
 		commentsViewer.getTree().setHeaderVisible(true);
 		commentsViewer.getTree().setLinesVisible(true);
+		commentsViewer.getTree().setData(FormToolkit.KEY_DRAW_BORDER,
+				FormToolkit.TREE_BORDER);
 
 		// Enable native tooltip support for column tooltips
 		ColumnViewerToolTipSupport.enableFor(commentsViewer);
@@ -262,8 +282,7 @@ public class PullRequestCommentsView extends ViewPart {
 				SWT.BORDER | SWT.WRAP | SWT.READ_ONLY | SWT.V_SCROLL);
 		GridDataFactory.fillDefaults().grab(true, true).applyTo(detailText);
 		detailText.setEditable(false);
-		detailText.setBackground(
-				parent.getDisplay().getSystemColor(SWT.COLOR_WHITE));
+		toolkit.adapt(detailText);
 
 		// Create bold font for headers in detail panel
 		FontData[] fontData = detailText.getFont().getFontData();
@@ -473,13 +492,13 @@ public class PullRequestCommentsView extends ViewPart {
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {
-					BitbucketClient client = createClient();
-					String projectKey = pr.getToRef().getRepository()
-							.getProject().getKey();
-					String repoSlug = pr.getToRef().getRepository().getSlug();
+					IPullRequestClient client = createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
 
-					client.addPullRequestComment(projectKey, repoSlug,
-							pr.getId(), replyText, comment.getId());
+					client.addComment(pr.getId(), replyText, comment.getId());
 
 					// Refresh comments after posting
 					refreshCommentsFromServer(pr);
@@ -505,13 +524,13 @@ public class PullRequestCommentsView extends ViewPart {
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {
-					BitbucketClient client = createClient();
-					String projectKey = pr.getToRef().getRepository()
-							.getProject().getKey();
-					String repoSlug = pr.getToRef().getRepository().getSlug();
+					IPullRequestClient client = createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
 
-					client.updateCommentSeverity(projectKey, repoSlug,
-							pr.getId(), comment.getId(),
+					client.updateCommentSeverity(pr.getId(), comment.getId(),
 							comment.getVersion(), severity);
 
 					refreshCommentsFromServer(pr);
@@ -538,13 +557,13 @@ public class PullRequestCommentsView extends ViewPart {
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
 				try {
-					BitbucketClient client = createClient();
-					String projectKey = pr.getToRef().getRepository()
-							.getProject().getKey();
-					String repoSlug = pr.getToRef().getRepository().getSlug();
+					IPullRequestClient client = createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
 
-					client.updateCommentState(projectKey, repoSlug,
-							pr.getId(), comment.getId(),
+					client.updateCommentState(pr.getId(), comment.getId(),
 							comment.getVersion(), state);
 
 					refreshCommentsFromServer(pr);
@@ -562,15 +581,13 @@ public class PullRequestCommentsView extends ViewPart {
 
 	private void refreshCommentsFromServer(PullRequest pr) {
 		try {
-			BitbucketClient client = createClient();
-			String projectKey = pr.getToRef().getRepository().getProject()
-					.getKey();
-			String repoSlug = pr.getToRef().getRepository().getSlug();
+			IPullRequestClient client = createClient();
+			if (client == null) {
+				Activator.logError("Pull request provider not configured", null); //$NON-NLS-1$
+				return;
+			}
 
-			String activitiesJson = client.getPullRequestActivities(projectKey,
-					repoSlug, pr.getId());
-			List<PullRequestComment> freshComments = PullRequestJsonParser
-					.parseActivities(activitiesJson);
+			List<PullRequestComment> freshComments = client.getPullRequestComments(pr.getId());
 
 			Display.getDefault().asyncExec(() -> {
 				if (!commentsViewer.getControl().isDisposed()) {
@@ -584,12 +601,53 @@ public class PullRequestCommentsView extends ViewPart {
 		}
 	}
 
-	private BitbucketClient createClient() {
-		String serverUrl = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_SERVER_URL);
-		String token = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
-		return new BitbucketClient(serverUrl, token);
+	/**
+	 * Updates the comments displayed in this view with the given list.
+	 * <p>
+	 * This method can be called from the UI thread to replace the current
+	 * comments without requiring a server round-trip. It is used by the
+	 * inline comment painter after posting a reply to synchronize both
+	 * views.
+	 * </p>
+	 *
+	 * @param comments
+	 *            the new list of comments to display; if {@code null}, the
+	 *            existing comments are cleared
+	 */
+	public void updateComments(List<PullRequestComment> comments) {
+		allComments.clear();
+		if (comments != null) {
+			allComments.addAll(comments);
+		}
+		refreshComments();
+	}
+
+	/**
+	 * Selects and reveals the given comment in the tree viewer. This causes
+	 * the detail panel to show the full comment thread, updates button
+	 * states, and highlights the comment's line in the compare editor.
+	 * <p>
+	 * This method is called when the user clicks on an inline comment bubble
+	 * to navigate to the full comment thread in this view.
+	 * </p>
+	 *
+	 * @param comment
+	 *            the comment to select and reveal; if {@code null}, no
+	 *            action is taken
+	 */
+	public void selectAndRevealComment(PullRequestComment comment) {
+		if (comment == null) {
+			return;
+		}
+		if (commentsViewer != null && !commentsViewer.getControl().isDisposed()) {
+			commentsViewer.setSelection(
+					new org.eclipse.jface.viewers.StructuredSelection(comment),
+					true);
+		}
+	}
+
+	private IPullRequestClient createClient() {
+		return PullRequestClientFactory.createClient();
 	}
 
 	private PullRequest getSelectedPullRequest() {
@@ -848,6 +906,51 @@ public class PullRequestCommentsView extends ViewPart {
 		List<StyleRange> styles = new ArrayList<>();
 		StringBuilder sb = new StringBuilder();
 
+		// Check if the selected comment is a reply (has inReplyToId > 0)
+		boolean isReply = comment.getInReplyToId() > 0;
+
+		if (isReply) {
+			// For reply comments, show only that single comment
+			appendCommentToDetail(sb, styles, comment);
+		} else {
+			// For root comments, show the full thread
+			List<PullRequestComment> thread = new ArrayList<>();
+			thread.add(comment);
+			if (comment.getReplies() != null) {
+				thread.addAll(comment.getReplies());
+			}
+
+			// Display each comment in the thread
+			for (int i = 0; i < thread.size(); i++) {
+				PullRequestComment c = thread.get(i);
+
+				appendCommentToDetail(sb, styles, c);
+
+				// Add separator between comments (but not after the last one)
+				if (i < thread.size() - 1) {
+					sb.append("\n\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\n"); //$NON-NLS-1$
+				}
+			}
+		}
+
+		detailText.setText(sb.toString());
+		for (StyleRange style : styles) {
+			detailText.setStyleRange(style);
+		}
+	}
+
+	/**
+	 * Appends a single comment to the detail panel text, with formatting.
+	 *
+	 * @param sb
+	 *            the string builder to append to
+	 * @param styles
+	 *            the list of style ranges to add formatting to
+	 * @param comment
+	 *            the comment to append
+	 */
+	private void appendCommentToDetail(StringBuilder sb,
+			List<StyleRange> styles, PullRequestComment comment) {
 		// Author and date header
 		String author = comment.getAuthorDisplayName() != null
 				? comment.getAuthorDisplayName()
@@ -876,8 +979,8 @@ public class PullRequestCommentsView extends ViewPart {
 
 		sb.append("\n"); //$NON-NLS-1$
 
-		// File / line info
-		if (comment.getPath() != null) {
+		// File / line info (only show for root comment to avoid repetition)
+		if (comment.getInReplyToId() <= 0 && comment.getPath() != null) {
 			sb.append(comment.getPath());
 			if (comment.getLine() != null) {
 				sb.append(":").append(comment.getLine()); //$NON-NLS-1$
@@ -893,10 +996,7 @@ public class PullRequestCommentsView extends ViewPart {
 			sb.append(text);
 		}
 
-		detailText.setText(sb.toString());
-		for (StyleRange style : styles) {
-			detailText.setStyleRange(style);
-		}
+		sb.append("\n"); //$NON-NLS-1$
 	}
 
 	private StyleRange createBoldRange(int start, int length) {
@@ -1039,8 +1139,8 @@ public class PullRequestCommentsView extends ViewPart {
 		for (IEditorReference ref : editorRefs) {
 			try {
 				IEditorInput input = ref.getEditorInput();
-				if (input instanceof BitbucketCompareEditorInput) {
-					BitbucketCompareEditorInput compareInput = (BitbucketCompareEditorInput) input;
+				if (input instanceof PullRequestCompareEditorInput) {
+					PullRequestCompareEditorInput compareInput = (PullRequestCompareEditorInput) input;
 					PullRequestChangedFile changedFile = compareInput
 							.getChangedFile();
 
@@ -1059,9 +1159,9 @@ public class PullRequestCommentsView extends ViewPart {
 							IEditorPart editor = ref.getEditor(true);
 							if (editor != null) {
 								page.activate(editor);
-								editorFound = true;
 								// Highlight the line
 								highlightCommentInCompareEditor(comment);
+								editorFound = true;
 								break;
 							}
 						}
@@ -1073,9 +1173,43 @@ public class PullRequestCommentsView extends ViewPart {
 			}
 		}
 
-		// If no editor was found, we can't open one here (would need access to
-		// the BitbucketClient and PR info, which is in ChangedFilesView)
-		// For now, just highlight if the editor is already open
+		// If an editor was found and activated, we're done
+		if (editorFound) {
+			return;
+		}
+
+		// If no editor was found, try to open one
+		IWorkbenchPart part = getSite().getWorkbenchWindow().getActivePage()
+				.findView(PullRequestChangedFilesView.VIEW_ID);
+		if (part instanceof PullRequestChangedFilesView) {
+			PullRequestChangedFilesView filesView = (PullRequestChangedFilesView) part;
+			List<PullRequestChangedFile> changedFiles = filesView
+					.getChangedFiles();
+
+			// Find the matching changed file for this comment's path
+			PullRequestChangedFile matchingFile = null;
+			String commentPath = comment.getPath();
+			for (PullRequestChangedFile file : changedFiles) {
+				String filePath = file.getPath();
+				String srcPath = file.getSrcPath();
+				if (commentPath.equals(filePath)
+						|| (srcPath != null && commentPath.equals(srcPath))) {
+					matchingFile = file;
+					break;
+				}
+			}
+
+			// If we found the matching file, open the compare editor
+			if (matchingFile != null) {
+				final PullRequestComment finalComment = comment;
+				filesView.openCompareEditor(matchingFile, () -> {
+					// Schedule highlight after a short delay to ensure editor
+					// widgets are fully initialized
+					Display.getDefault().asyncExec(
+							() -> highlightCommentInCompareEditor(finalComment));
+				});
+			}
+		}
 	}
 
 	/**
@@ -1105,8 +1239,8 @@ public class PullRequestCommentsView extends ViewPart {
 		for (IEditorReference ref : editorRefs) {
 			try {
 				IEditorInput input = ref.getEditorInput();
-				if (input instanceof BitbucketCompareEditorInput) {
-					BitbucketCompareEditorInput compareInput = (BitbucketCompareEditorInput) input;
+				if (input instanceof PullRequestCompareEditorInput) {
+					PullRequestCompareEditorInput compareInput = (PullRequestCompareEditorInput) input;
 					PullRequestChangedFile changedFile = compareInput
 							.getChangedFile();
 
@@ -1174,8 +1308,8 @@ public class PullRequestCommentsView extends ViewPart {
 	 * @return the control containing StyledText widgets, or null if not found
 	 */
 	private Control findEditorControl(IEditorPart editor,
-			BitbucketCompareEditorInput compareInput) {
-		// First try: get from BitbucketCompareEditorInput directly
+			PullRequestCompareEditorInput compareInput) {
+		// First try: get from PullRequestCompareEditorInput directly
 		Control viewerControl = compareInput.getViewerControl();
 		if (viewerControl != null && !viewerControl.isDisposed()) {
 			return viewerControl;
@@ -1428,6 +1562,11 @@ public class PullRequestCommentsView extends ViewPart {
 
 	/**
 	 * Recursive helper to find comment depth in tree
+	 *
+	 * @param target
+	 * @param current
+	 * @param currentDepth
+	 * @return sdsfdfs
 	 */
 	private int findCommentDepth(PullRequestComment target,
 			PullRequestComment current, int currentDepth) {
@@ -1462,72 +1601,32 @@ public class PullRequestCommentsView extends ViewPart {
 		commentsViewer.refresh(comment);
 	}
 
+	// MultiLineInputDialog extracted to standalone class in same package
+
 	/**
-	 * Multi-line input dialog for entering comment replies with a larger,
-	 * resizable text area.
+	 * Updates the highlight color from Eclipse editor selection background
+	 * preference. Disposes the old color if it exists and creates a new one.
 	 */
-	private static class MultiLineInputDialog extends Dialog {
-		private String title;
-
-		private String message;
-
-		private String value = ""; //$NON-NLS-1$
-
-		private Text textControl;
-
-		public MultiLineInputDialog(Shell parentShell, String dialogTitle,
-				String dialogMessage, String initialValue) {
-			super(parentShell);
-			this.title = dialogTitle;
-			this.message = dialogMessage;
-			if (initialValue != null) {
-				this.value = initialValue;
-			}
-			// Enable resizing
-			setShellStyle(getShellStyle() | SWT.RESIZE);
+	private void updateHighlightColor() {
+		// Dispose old color if it exists
+		if (highlightColor != null && !highlightColor.isDisposed()) {
+			highlightColor.dispose();
 		}
 
-		@Override
-		protected void configureShell(Shell shell) {
-			super.configureShell(shell);
-			if (title != null) {
-				shell.setText(title);
-			}
-			// Set minimum size
-			shell.setMinimumSize(400, 200);
-		}
+		// Get the selection background color from Eclipse editor preferences
+		IPreferenceStore store = EditorsUI.getPreferenceStore();
+		boolean useSystemDefault = store.getBoolean(
+				AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND_SYSTEM_DEFAULT);
 
-		@Override
-		protected Control createDialogArea(Composite parent) {
-			Composite composite = (Composite) super.createDialogArea(parent);
-			GridLayoutFactory.swtDefaults().applyTo(composite);
-
-			// Message label
-			if (message != null) {
-				Label label = new Label(composite, SWT.WRAP);
-				label.setText(message);
-				GridDataFactory.fillDefaults().grab(true, false)
-						.hint(350, SWT.DEFAULT).applyTo(label);
-			}
-
-			// Multi-line text field
-			textControl = new Text(composite,
-					SWT.MULTI | SWT.BORDER | SWT.WRAP | SWT.V_SCROLL);
-			textControl.setText(value);
-			GridDataFactory.fillDefaults().grab(true, true).hint(400, 150)
-					.applyTo(textControl);
-
-			return composite;
-		}
-
-		@Override
-		protected void okPressed() {
-			value = textControl.getText();
-			super.okPressed();
-		}
-
-		public String getValue() {
-			return value;
+		if (useSystemDefault) {
+			// Use system default selection color
+			highlightColor = Display.getDefault()
+					.getSystemColor(SWT.COLOR_LIST_SELECTION);
+		} else {
+			// Use custom color from preferences
+			RGB rgb = PreferenceConverter.getColor(store,
+					AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND);
+			highlightColor = new Color(rgb);
 		}
 	}
 
@@ -1541,6 +1640,11 @@ public class PullRequestCommentsView extends ViewPart {
 		// Clear any active highlight
 		clearHighlight();
 
+		if (editorPropertyChangeListener != null) {
+			EditorsUI.getPreferenceStore()
+					.removePropertyChangeListener(editorPropertyChangeListener);
+			editorPropertyChangeListener = null;
+		}
 		if (fileSelectionListener != null) {
 			getSite().getWorkbenchWindow().getSelectionService()
 					.removeSelectionListener(

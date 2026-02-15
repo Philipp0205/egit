@@ -17,7 +17,6 @@ import java.util.List;
 import java.util.stream.Collectors;
 
 import org.eclipse.compare.CompareUI;
-import org.eclipse.core.resources.IFile;
 import org.eclipse.core.resources.IResource;
 import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.IProgressMonitor;
@@ -25,16 +24,18 @@ import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.jobs.Job;
 import org.eclipse.egit.core.RepositoryCache;
-import org.eclipse.egit.core.internal.bitbucket.BitbucketClient;
 import org.eclipse.egit.core.internal.bitbucket.ChangedFile;
 import org.eclipse.egit.core.internal.bitbucket.PullRequest;
 import org.eclipse.egit.core.internal.bitbucket.PullRequestComment;
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
+import org.eclipse.egit.core.internal.pullrequest.PullRequestClientFactory;
 import org.eclipse.egit.ui.Activator;
 import org.eclipse.egit.ui.UIPreferences;
 import org.eclipse.egit.ui.UIUtils;
 import org.eclipse.egit.ui.internal.ActionUtils;
 import org.eclipse.egit.ui.internal.UIIcons;
 import org.eclipse.egit.ui.internal.UIText;
+import org.eclipse.egit.ui.internal.commit.DiffViewer;
 import org.eclipse.jface.action.Action;
 import org.eclipse.jface.action.IAction;
 import org.eclipse.jface.action.IMenuListener;
@@ -56,21 +57,19 @@ import org.eclipse.jgit.lib.Repository;
 import org.eclipse.jgit.transport.RemoteConfig;
 import org.eclipse.jgit.transport.URIish;
 import org.eclipse.swt.SWT;
-import org.eclipse.swt.events.KeyAdapter;
-import org.eclipse.swt.events.KeyEvent;
 import org.eclipse.swt.dnd.Clipboard;
 import org.eclipse.swt.dnd.TextTransfer;
 import org.eclipse.swt.dnd.Transfer;
+import org.eclipse.swt.events.KeyAdapter;
+import org.eclipse.swt.events.KeyEvent;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.ISelectionListener;
 import org.eclipse.ui.IWorkbenchPart;
-import org.eclipse.ui.PartInitException;
 import org.eclipse.ui.actions.ActionFactory;
 import org.eclipse.ui.forms.widgets.Form;
 import org.eclipse.ui.forms.widgets.FormToolkit;
-import org.eclipse.ui.ide.IDE;
 import org.eclipse.ui.part.IShowInSource;
 import org.eclipse.ui.part.ShowInContext;
 import org.eclipse.ui.part.ViewPart;
@@ -115,7 +114,7 @@ public class PullRequestChangedFilesView extends ViewPart {
 		GridLayoutFactory.fillDefaults().applyTo(form.getBody());
 
 		TreeColumnLayout treeColumnLayout = new TreeColumnLayout();
-		Composite layoutComposite = new Composite(form.getBody(), SWT.NONE);
+		Composite layoutComposite = toolkit.createComposite(form.getBody());
 		layoutComposite.setLayout(treeColumnLayout);
 		GridDataFactory.fillDefaults().grab(true, true)
 				.applyTo(layoutComposite);
@@ -124,6 +123,8 @@ public class PullRequestChangedFilesView extends ViewPart {
 				SWT.BORDER | SWT.FULL_SELECTION | SWT.MULTI);
 		changedFilesViewer.getTree().setHeaderVisible(true);
 		changedFilesViewer.getTree().setLinesVisible(true);
+		changedFilesViewer.getTree().setData(FormToolkit.KEY_DRAW_BORDER,
+				FormToolkit.TREE_BORDER);
 
 		setupColumns(treeColumnLayout);
 
@@ -255,7 +256,7 @@ public class PullRequestChangedFilesView extends ViewPart {
 	}
 
 	/**
-	 * Attempts to resolve the local Git repository that matches the Bitbucket
+	 * Attempts to resolve the local Git repository that matches the
 	 * pull request.
 	 *
 	 * @param pr
@@ -263,15 +264,35 @@ public class PullRequestChangedFilesView extends ViewPart {
 	 * @return the matching Git repository, or null if not found
 	 */
 	private Repository resolveGitRepository(PullRequest pr) {
-		String serverUrl = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_SERVER_URL);
-		String projectKey = pr.getToRef().getRepository().getProject()
-				.getKey();
-		String repoSlug = pr.getToRef().getRepository().getSlug();
+		String providerType = Activator.getDefault().getPreferenceStore()
+				.getString(UIPreferences.PULLREQUEST_PROVIDER_TYPE);
 
-		// Build expected path fragment: /scm/{projectKey}/{repoSlug}
-		String pathFragment = "/scm/" + projectKey.toLowerCase() + "/" //$NON-NLS-1$ //$NON-NLS-2$
-				+ repoSlug.toLowerCase();
+		String serverUrl = null;
+		String pathFragment = null;
+
+		if ("BITBUCKET".equals(providerType)) { //$NON-NLS-1$
+			serverUrl = Activator.getDefault().getPreferenceStore()
+					.getString(UIPreferences.BITBUCKET_SERVER_URL);
+			String projectKey = pr.getToRef().getRepository().getProject()
+					.getKey();
+			String repoSlug = pr.getToRef().getRepository().getSlug();
+			// Build expected path fragment: /scm/{projectKey}/{repoSlug}
+			pathFragment = "/scm/" + projectKey.toLowerCase() + "/" //$NON-NLS-1$ //$NON-NLS-2$
+					+ repoSlug.toLowerCase();
+		} else if ("GITHUB".equals(providerType)) { //$NON-NLS-1$
+			serverUrl = "github.com"; //$NON-NLS-1$
+			String owner = Activator.getDefault().getPreferenceStore()
+					.getString(UIPreferences.GITHUB_OWNER);
+			String repo = Activator.getDefault().getPreferenceStore()
+					.getString(UIPreferences.GITHUB_REPO);
+			// Build expected path fragment: /{owner}/{repo}
+			pathFragment = "/" + owner.toLowerCase() + "/" //$NON-NLS-1$ //$NON-NLS-2$
+					+ repo.toLowerCase();
+		}
+
+		if (serverUrl == null || pathFragment == null) {
+			return null;
+		}
 
 		// Search all repositories in the workspace
 		for (Repository repo : RepositoryCache.INSTANCE.getAllRepositories()) {
@@ -306,30 +327,18 @@ public class PullRequestChangedFilesView extends ViewPart {
 		Job job = new Job("Fetching changed files") { //$NON-NLS-1$
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
-				monitor.beginTask("Fetching changed files from Bitbucket", //$NON-NLS-1$
+				monitor.beginTask("Fetching changed files", //$NON-NLS-1$
 						IProgressMonitor.UNKNOWN);
 
 				try {
-					final String serverUrl = Activator.getDefault()
-							.getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_SERVER_URL);
-					final String token = Activator.getDefault()
-							.getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
-
-					BitbucketClient client = new BitbucketClient(serverUrl,
-							token);
-
-					String projectKey = pr.getToRef().getRepository()
-							.getProject().getKey();
-					String repoSlug = pr.getToRef().getRepository().getSlug();
+					IPullRequestClient client = PullRequestClientFactory.createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
 
 					// Fetch changed files
-					String jsonResponse = client.getPullRequestChanges(
-							projectKey, repoSlug, pr.getId());
-
-					List<ChangedFile> apiChangedFiles = PullRequestJsonParser
-							.parseChangedFiles(jsonResponse);
+					List<ChangedFile> apiChangedFiles = client.getPullRequestChanges(pr.getId());
 
 					final List<PullRequestChangedFile> uiChangedFiles = apiChangedFiles
 							.stream()
@@ -339,13 +348,9 @@ public class PullRequestChangedFilesView extends ViewPart {
 					// Fetch pull request activities (including comments)
 					final List<PullRequestComment> comments = new ArrayList<>();
 					try {
-						String activitiesJson = client
-								.getPullRequestActivities(projectKey, repoSlug,
-										pr.getId());
-						comments.addAll(PullRequestJsonParser
-								.parseActivities(activitiesJson));
+						comments.addAll(client.getPullRequestComments(pr.getId()));
 					} catch (Exception e) {
-						Activator.logError("Failed to fetch PR activities", e); //$NON-NLS-1$
+						Activator.logError("Failed to fetch PR comments", e); //$NON-NLS-1$
 					}
 
 					Display.getDefault().asyncExec(() -> {
@@ -392,9 +397,28 @@ public class PullRequestChangedFilesView extends ViewPart {
 	}
 
 	private void openCompareEditor(PullRequestChangedFile file) {
+		openCompareEditor(file, null);
+	}
+
+	/**
+	 * Opens a compare editor for the given file with an optional callback to
+	 * run after the editor is opened.
+	 *
+	 * @param file
+	 *            the changed file to open
+	 * @param afterOpen
+	 *            optional callback to run after the editor opens (may be null)
+	 */
+	public void openCompareEditor(PullRequestChangedFile file,
+			Runnable afterOpen) {
+		System.out.println("[PullRequestChangedFilesView] openCompareEditor called for file: " + file.getPath()); //$NON-NLS-1$
+
 		if (selectedPullRequest == null) {
+			System.out.println("[PullRequestChangedFilesView] No pull request selected, aborting"); //$NON-NLS-1$
 			return;
 		}
+
+		System.out.println("[PullRequestChangedFilesView] PR #" + selectedPullRequest.getId() + ", file has " + getCommentCountForFile(file.getPath(), file.getSrcPath()) + " comments"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 
 		// Open compare editor in a background job
 		Job job = new Job("Opening file comparison") { //$NON-NLS-1$
@@ -404,18 +428,19 @@ public class PullRequestChangedFilesView extends ViewPart {
 					monitor.beginTask("Preparing comparison", //$NON-NLS-1$
 							IProgressMonitor.UNKNOWN);
 
-					final String serverUrl = Activator.getDefault()
-							.getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_SERVER_URL);
-					final String token = Activator.getDefault()
-							.getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
+					System.out.println("[PullRequestChangedFilesView] Job started for file: " + file.getPath()); //$NON-NLS-1$
 
-					BitbucketClient client = new BitbucketClient(serverUrl,
-							token);
+					IPullRequestClient client = PullRequestClientFactory
+							.createClient();
+					if (client == null) {
+						System.out.println("[PullRequestChangedFilesView] Failed to create pull request client"); //$NON-NLS-1$
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
 
 					// Create compare editor input
-					final BitbucketCompareEditorInput input = new BitbucketCompareEditorInput(
+					System.out.println("[PullRequestChangedFilesView] Creating PullRequestCompareEditorInput"); //$NON-NLS-1$
+					final PullRequestCompareEditorInput input = new PullRequestCompareEditorInput(
 							client, selectedPullRequest, file);
 
 					// Filter comments for this specific file
@@ -427,21 +452,40 @@ public class PullRequestChangedFilesView extends ViewPart {
 								String commentPath = comment.getPath();
 								String filePath = file.getPath();
 								String srcPath = file.getSrcPath();
-								return commentPath.equals(filePath)
-										|| (srcPath != null && commentPath.equals(srcPath));
-							})
-							.collect(Collectors.toList());
+								return commentPath.equals(filePath) || (srcPath != null
+										&& commentPath.equals(srcPath));
+							}).collect(Collectors.toList());
+
+					System.out.println("[PullRequestChangedFilesView] Filtered " + fileComments.size() + " comments for file"); //$NON-NLS-1$ //$NON-NLS-2$
 
 					// Set comments on the compare input
 					input.setComments(fileComments);
 
 					// Open compare editor in UI thread
 					Display.getDefault().asyncExec(() -> {
-						CompareUI.openCompareEditor(input);
+						System.out.println("[PullRequestChangedFilesView] Opening compare editor in UI thread"); //$NON-NLS-1$
+						System.out.println("[PullRequestChangedFilesView] About to call CompareUI.openCompareEditor()"); //$NON-NLS-1$
+						try {
+							// Use openCompareEditor with the flag to run the input preparation
+							// This ensures prepareInput() is called
+							CompareUI.openCompareEditor(input, true);
+							System.out.println("[PullRequestChangedFilesView] CompareUI.openCompareEditor() returned successfully"); //$NON-NLS-1$
+						} catch (Exception e) {
+							System.out.println("[PullRequestChangedFilesView] Exception in CompareUI.openCompareEditor(): " + e.getMessage()); //$NON-NLS-1$
+							e.printStackTrace();
+						}
+						// Execute callback after editor opens
+						if (afterOpen != null) {
+							System.out.println("[PullRequestChangedFilesView] Executing afterOpen callback"); //$NON-NLS-1$
+							afterOpen.run();
+						}
 					});
 
+					System.out.println("[PullRequestChangedFilesView] Job completed for file: " + file.getPath()); //$NON-NLS-1$
 					return Status.OK_STATUS;
 				} catch (Exception e) {
+					System.out.println("[PullRequestChangedFilesView] Error opening compare editor: " + e.getMessage()); //$NON-NLS-1$
+					e.printStackTrace();
 					return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
 							"Failed to open comparison", e); //$NON-NLS-1$
 				} finally {
@@ -451,6 +495,7 @@ public class PullRequestChangedFilesView extends ViewPart {
 		};
 		job.setUser(false);
 		job.schedule();
+		System.out.println("[PullRequestChangedFilesView] Job scheduled"); //$NON-NLS-1$
 	}
 
 	private void updateFormTitle() {
@@ -522,6 +567,15 @@ public class PullRequestChangedFilesView extends ViewPart {
 	 */
 	public PullRequest getSelectedPullRequest() {
 		return selectedPullRequest;
+	}
+
+	/**
+	 * Get the list of changed files for the current pull request
+	 *
+	 * @return list of changed files
+	 */
+	public List<PullRequestChangedFile> getChangedFiles() {
+		return changedFiles;
 	}
 
 	@Override
@@ -636,10 +690,9 @@ public class PullRequestChangedFilesView extends ViewPart {
 							openInWorkspace(selectedFiles);
 						}
 					};
-					// Enable only if at least one file exists (not deleted) and can potentially be opened
+					// Enable for non-deleted files - actual file resolution happens on action execution
 					boolean anyOpenable = selectedFiles.stream()
-							.anyMatch(f -> f.getChangeType() != PullRequestChangedFile.ChangeType.DELETED
-									&& (f.getWorkspaceFile() != null || f.getLocation() != null));
+							.anyMatch(f -> f.getChangeType() != PullRequestChangedFile.ChangeType.DELETED);
 					openInWorkspaceAction.setEnabled(anyOpenable);
 					menuMgr.add(openInWorkspaceAction);
 				}
@@ -760,17 +813,24 @@ public class PullRequestChangedFilesView extends ViewPart {
 	}
 
 	/**
-	 * Opens the selected files in the workspace editor. If a file cannot be
-	 * found in the workspace, attempts to open it from the filesystem using
-	 * the repository's working tree.
+	 * Opens the selected changed files in the working tree editor.
+	 * <p>
+	 * This method constructs the absolute filesystem path from the repository
+	 * working tree and opens the file via
+	 * {@link DiffViewer#openFileInEditor(java.io.File, int)}. This approach
+	 * follows the pattern used in StagingView, which is more reliable than
+	 * trying to resolve workspace files first since PR files may not be in a
+	 * Git-shared project.
+	 * </p>
 	 *
 	 * @param files
 	 *            the files to open
 	 */
 	private void openInWorkspace(List<PullRequestChangedFile> files) {
-		int successCount = 0;
-		int failureCount = 0;
-		StringBuilder failedFiles = new StringBuilder();
+		Repository repo = gitRepository;
+		if (repo == null) {
+			return;
+		}
 
 		for (PullRequestChangedFile file : files) {
 			// Skip deleted files
@@ -778,58 +838,11 @@ public class PullRequestChangedFilesView extends ViewPart {
 				continue;
 			}
 
-			boolean opened = false;
-
-			// First try: workspace file
-			IFile workspaceFile = file.getWorkspaceFile();
-			if (workspaceFile != null && workspaceFile.exists()) {
-				try {
-					IDE.openEditor(getSite().getPage(), workspaceFile);
-					opened = true;
-					successCount++;
-				} catch (PartInitException e) {
-					Activator.logError("Failed to open file in editor: " //$NON-NLS-1$
-							+ workspaceFile.getFullPath(), e);
-				}
-			}
-
-			// Second try: filesystem fallback (if file is in repository working tree)
-			if (!opened) {
-				IPath location = file.getLocation();
-				if (location != null) {
-					java.io.File fsFile = location.toFile();
-					if (fsFile.exists()) {
-						try {
-							org.eclipse.egit.ui.internal.EgitUiEditorUtils
-									.openEditor(fsFile, getSite().getPage());
-							opened = true;
-							successCount++;
-						} catch (Exception e) {
-							Activator.logError(
-									"Failed to open file from filesystem: " //$NON-NLS-1$
-											+ location.toOSString(),
-									e);
-						}
-					}
-				}
-			}
-
-			// Track failures
-			if (!opened) {
-				failureCount++;
-				if (failedFiles.length() > 0) {
-					failedFiles.append("\n"); //$NON-NLS-1$
-				}
-				failedFiles.append(file.getPath());
-			}
-		}
-
-		// Show error message if any files couldn't be opened
-		if (failureCount > 0) {
-			String message = MessageFormat.format(
-					"Failed to open {0} file(s):\n\n{1}\n\nThe files may not exist in the workspace or repository working tree. The PR branch may need to be checked out locally.", //$NON-NLS-1$
-					Integer.valueOf(failureCount), failedFiles.toString());
-			Activator.showError(message, null);
+			String relativePath = file.getPath();
+			java.io.File fsFile = new org.eclipse.core.runtime.Path(
+					repo.getWorkTree().getAbsolutePath())
+					.append(relativePath).toFile();
+			DiffViewer.openFileInEditor(fsFile, -1);
 		}
 	}
 }

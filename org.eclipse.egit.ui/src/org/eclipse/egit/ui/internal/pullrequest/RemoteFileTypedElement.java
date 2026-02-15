@@ -29,14 +29,14 @@ import org.eclipse.core.runtime.NullProgressMonitor;
 import org.eclipse.core.runtime.Path;
 import org.eclipse.core.runtime.Platform;
 import org.eclipse.core.runtime.Status;
-import org.eclipse.egit.core.internal.bitbucket.BitbucketClient;
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
 import org.eclipse.jface.text.IDocument;
 import org.eclipse.swt.graphics.Image;
 import org.eclipse.ui.IEditorInput;
 import org.eclipse.ui.texteditor.IDocumentProvider;
 
 /**
- * Represents a file from Bitbucket for use in compare editors.
+ * Represents a remote file from a pull request provider for use in compare editors.
  * <p>
  * This implementation extends the pattern used by EGit's
  * {@code StorageTypedElement} to provide proper integration with Eclipse's
@@ -53,12 +53,8 @@ import org.eclipse.ui.texteditor.IDocumentProvider;
  * <li>Supports charset/encoding detection</li>
  * </ul>
  */
-public class BitbucketFileTypedElement
+public class RemoteFileTypedElement
 		implements ITypedElement, IEncodedStreamContentAccessor, IAdaptable {
-
-	private final String projectKey;
-
-	private final String repoSlug;
 
 	private final String commitId;
 
@@ -66,31 +62,24 @@ public class BitbucketFileTypedElement
 
 	private final String name;
 
-	private final BitbucketClient client;
+	private final IPullRequestClient client;
 
 	private IStorage bufferedStorage;
 
 	private ISharedDocumentAdapter sharedDocumentAdapter;
 
 	/**
-	 * Creates a new BitbucketFileTypedElement
+	 * Creates a new RemoteFileTypedElement
 	 *
 	 * @param client
-	 *            the Bitbucket client to use
-	 * @param projectKey
-	 *            the project key
-	 * @param repoSlug
-	 *            the repository slug
+	 *            the pull request client to use
 	 * @param commitId
 	 *            the commit ID to fetch the file from
 	 * @param path
 	 *            the file path
 	 */
-	public BitbucketFileTypedElement(BitbucketClient client, String projectKey,
-			String repoSlug, String commitId, String path) {
+	public RemoteFileTypedElement(IPullRequestClient client, String commitId, String path) {
 		this.client = client;
-		this.projectKey = projectKey;
-		this.repoSlug = repoSlug;
 		this.commitId = commitId;
 		this.path = path;
 		// Extract file name from path
@@ -157,7 +146,7 @@ public class BitbucketFileTypedElement
 	}
 
 	/**
-	 * Fetches the file contents from Bitbucket.
+	 * Fetches the file contents from the pull request provider.
 	 *
 	 * @param monitor
 	 *            progress monitor
@@ -168,12 +157,11 @@ public class BitbucketFileTypedElement
 	protected IStorage fetchContents(IProgressMonitor monitor)
 			throws CoreException {
 		try {
-			byte[] content = client.getFileContent(projectKey, repoSlug,
-					commitId, path);
-			return new BitbucketFileStorage(name, path, content);
+			byte[] content = client.getFileContent(commitId, path);
+			return new RemoteFileStorage(name, path, content);
 		} catch (IOException e) {
 			throw new CoreException(Status.error(
-					"Failed to fetch file content from Bitbucket: " //$NON-NLS-1$
+					"Failed to fetch file content: " //$NON-NLS-1$
 							+ e.getMessage(),
 					e));
 		}
@@ -231,7 +219,7 @@ public class BitbucketFileTypedElement
 
 			@Override
 			public IEditorInput getDocumentKey(Object element) {
-				return BitbucketFileTypedElement.this.getDocumentKey(element);
+				return RemoteFileTypedElement.this.getDocumentKey(element);
 			}
 
 			@Override
@@ -252,7 +240,7 @@ public class BitbucketFileTypedElement
 	 */
 	protected IEditorInput getDocumentKey(Object element) {
 		if (element == this && bufferedStorage != null) {
-			return new BitbucketFileEditorInput(this, bufferedStorage);
+			return new RemoteFileEditorInput(this, bufferedStorage);
 		}
 		return null;
 	}
@@ -263,8 +251,6 @@ public class BitbucketFileTypedElement
 		int result = 1;
 		result = prime * result + ((commitId == null) ? 0 : commitId.hashCode());
 		result = prime * result + ((path == null) ? 0 : path.hashCode());
-		result = prime * result + ((projectKey == null) ? 0 : projectKey.hashCode());
-		result = prime * result + ((repoSlug == null) ? 0 : repoSlug.hashCode());
 		return result;
 	}
 
@@ -276,7 +262,7 @@ public class BitbucketFileTypedElement
 		if (obj == null || getClass() != obj.getClass()) {
 			return false;
 		}
-		BitbucketFileTypedElement other = (BitbucketFileTypedElement) obj;
+		RemoteFileTypedElement other = (RemoteFileTypedElement) obj;
 		if (commitId == null) {
 			if (other.commitId != null) {
 				return false;
@@ -291,27 +277,13 @@ public class BitbucketFileTypedElement
 		} else if (!path.equals(other.path)) {
 			return false;
 		}
-		if (projectKey == null) {
-			if (other.projectKey != null) {
-				return false;
-			}
-		} else if (!projectKey.equals(other.projectKey)) {
-			return false;
-		}
-		if (repoSlug == null) {
-			if (other.repoSlug != null) {
-				return false;
-			}
-		} else if (!repoSlug.equals(other.repoSlug)) {
-			return false;
-		}
 		return true;
 	}
 
 	/**
-	 * Internal storage implementation for Bitbucket file contents.
+	 * Internal storage implementation for remote file contents.
 	 */
-	private static class BitbucketFileStorage implements IEncodedStorage {
+	private static class RemoteFileStorage implements IEncodedStorage {
 
 		private final String name;
 
@@ -319,7 +291,7 @@ public class BitbucketFileTypedElement
 
 		private final byte[] content;
 
-		BitbucketFileStorage(String name, String fullPath, byte[] content) {
+		RemoteFileStorage(String name, String fullPath, byte[] content) {
 			this.name = name;
 			this.fullPath = fullPath;
 			this.content = content;

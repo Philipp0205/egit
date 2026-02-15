@@ -18,14 +18,18 @@ import java.io.OutputStream;
 import java.net.HttpURLConnection;
 import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.util.List;
 
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
+import org.eclipse.egit.core.internal.pullrequest.PullRequestProviderCapabilities;
+import org.eclipse.egit.core.internal.pullrequest.PullRequestProviderType;
 import org.eclipse.jgit.annotations.NonNull;
 import org.eclipse.jgit.annotations.Nullable;
 
 /**
  * REST client for Bitbucket Data Center API
  */
-public class BitbucketClient {
+public class BitbucketClient implements IPullRequestClient {
 
 	private static final String API_BASE_PATH = "/rest/api/1.0"; //$NON-NLS-1$
 
@@ -33,70 +37,52 @@ public class BitbucketClient {
 
 	private final String serverUrl;
 
+	private final String projectKey;
+
+	private final String repositorySlug;
+
 	private final String token;
+
+	private final PullRequestProviderCapabilities capabilities;
 
 	/**
 	 * Creates a new Bitbucket client
 	 *
 	 * @param serverUrl
 	 *            the Bitbucket server URL (e.g., https://bitbucket.example.com)
+	 * @param projectKey
+	 *            the project key (e.g., "PROJ")
+	 * @param repositorySlug
+	 *            the repository slug (e.g., "my-repo")
 	 * @param token
 	 *            the personal access token for authentication
 	 */
-	public BitbucketClient(@NonNull String serverUrl, @NonNull String token) {
+	public BitbucketClient(@NonNull String serverUrl,
+			@NonNull String projectKey, @NonNull String repositorySlug,
+			@NonNull String token) {
 		this.serverUrl = serverUrl.endsWith("/") ? serverUrl.substring(0, serverUrl.length() - 1) : serverUrl; //$NON-NLS-1$
+		this.projectKey = projectKey;
+		this.repositorySlug = repositorySlug;
 		this.token = token;
+		this.capabilities = new PullRequestProviderCapabilities(true, true,
+				"OPEN", "MERGED", "DECLINED", "ALL"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
 	}
 
-	/**
-	 * Retrieves pull requests for a specific repository
-	 *
-	 * @param projectKey
-	 *            the project key (e.g., "PROJ")
-	 * @param repositorySlug
-	 *            the repository slug (e.g., "my-repo")
-	 * @param state
-	 *            the PR state filter ("OPEN", "MERGED", "DECLINED", or null for
-	 *            all)
-	 * @param limit
-	 *            the maximum number of results per page (max 1000)
-	 * @param start
-	 *            the start index for pagination
-	 * @return the JSON response as a string
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String getPullRequests(@NonNull String projectKey,
-			@NonNull String repositorySlug, @Nullable String state,
-			int limit, int start) throws IOException {
-		return getPullRequests(projectKey, repositorySlug, state, null, null,
-				limit, start);
+	@Override
+	@NonNull
+	public PullRequestProviderType getProviderType() {
+		return PullRequestProviderType.BITBUCKET;
 	}
 
-	/**
-	 * Retrieves pull requests for a specific repository with user filters
-	 *
-	 * @param projectKey
-	 *            the project key (e.g., "PROJ")
-	 * @param repositorySlug
-	 *            the repository slug (e.g., "my-repo")
-	 * @param state
-	 *            the PR state filter ("OPEN", "MERGED", "DECLINED", or null for
-	 *            all)
-	 * @param authorUsername
-	 *            filter by author username (or null for all)
-	 * @param reviewerUsername
-	 *            filter by reviewer username (or null for all)
-	 * @param limit
-	 *            the maximum number of results per page (max 1000)
-	 * @param start
-	 *            the start index for pagination
-	 * @return the JSON response as a string
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String getPullRequests(@NonNull String projectKey,
-			@NonNull String repositorySlug, @Nullable String state,
+	@Override
+	@NonNull
+	public PullRequestProviderCapabilities getCapabilities() {
+		return capabilities;
+	}
+
+	@Override
+	@NonNull
+	public List<PullRequest> getPullRequests(@Nullable String state,
 			@Nullable String authorUsername, @Nullable String reviewerUsername,
 			int limit, int start) throws IOException {
 		StringBuilder urlBuilder = new StringBuilder();
@@ -108,7 +94,7 @@ public class BitbucketClient {
 		urlBuilder.append("?limit=").append(Math.min(limit, 1000)); //$NON-NLS-1$
 		urlBuilder.append("&start=").append(start); //$NON-NLS-1$
 
-		if (state != null && !state.isEmpty()) {
+		if (state != null && !state.isEmpty() && !"ALL".equals(state)) { //$NON-NLS-1$
 			urlBuilder.append("&state=").append(state); //$NON-NLS-1$
 		}
 
@@ -123,100 +109,49 @@ public class BitbucketClient {
 		}
 
 		String url = urlBuilder.toString();
-		return executeGet(url);
+		String jsonResponse = executeGet(url);
+		return BitbucketJsonParser.parsePullRequests(jsonResponse);
 	}
 
-	/**
-	 * Retrieves a specific pull request by ID
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param pullRequestId
-	 *            the pull request ID
-	 * @return the JSON response as a string
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String getPullRequest(@NonNull String projectKey,
-			@NonNull String repositorySlug, long pullRequestId)
-			throws IOException {
+	@Override
+	@NonNull
+	public PullRequest getPullRequest(long pullRequestId) throws IOException {
 		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
 				+ "/repos/" + repositorySlug //$NON-NLS-1$
 				+ "/pull-requests/" + pullRequestId; //$NON-NLS-1$
 
-		return executeGet(url);
+		String jsonResponse = executeGet(url);
+		return BitbucketJsonParser.parseSinglePullRequest(jsonResponse);
 	}
 
-	/**
-	 * Tests the connection to the Bitbucket server
-	 *
-	 * @return true if the connection is successful
-	 */
-	public boolean testConnection() {
-		try {
-			String url = serverUrl + API_BASE_PATH + "/application-properties"; //$NON-NLS-1$
-			executeGet(url);
-			return true;
-		} catch (IOException e) {
-			return false;
-		}
-	}
-
-	/**
-	 * Gets the current authenticated user's information
-	 *
-	 * @return JSON response with user information including "name" field
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String getCurrentUser() throws IOException {
-		String url = serverUrl + API_BASE_PATH + "/users/current"; //$NON-NLS-1$
-		return executeGet(url);
-	}
-
-	/**
-	 * Retrieves changed files for a pull request
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param pullRequestId
-	 *            the pull request ID
-	 * @return the JSON response containing changed files
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String getPullRequestChanges(@NonNull String projectKey,
-			@NonNull String repositorySlug, long pullRequestId)
+	@Override
+	@NonNull
+	public List<ChangedFile> getPullRequestChanges(long pullRequestId)
 			throws IOException {
 		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
 				+ "/repos/" + repositorySlug //$NON-NLS-1$
 				+ "/pull-requests/" + pullRequestId + "/changes"; //$NON-NLS-1$ //$NON-NLS-2$
 
-		return executeGet(url);
+		String jsonResponse = executeGet(url);
+		return BitbucketJsonParser.parseChangedFiles(jsonResponse);
 	}
 
-	/**
-	 * Retrieves raw file content at a specific commit
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param commitId
-	 *            the commit SHA or branch name
-	 * @param path
-	 *            the file path
-	 * @return raw file content as byte array
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public byte[] getFileContent(@NonNull String projectKey,
-			@NonNull String repositorySlug, @NonNull String commitId,
-			@NonNull String path) throws IOException {
+	@Override
+	@NonNull
+	public List<PullRequestComment> getPullRequestComments(long pullRequestId)
+			throws IOException {
+		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
+				+ "/repos/" + repositorySlug //$NON-NLS-1$
+				+ "/pull-requests/" + pullRequestId + "/activities"; //$NON-NLS-1$ //$NON-NLS-2$
+
+		String jsonResponse = executeGet(url);
+		return BitbucketJsonParser.parseActivities(jsonResponse);
+	}
+
+	@Override
+	@NonNull
+	public byte[] getFileContent(@NonNull String commitId, @NonNull String path)
+			throws IOException {
 		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
 				+ "/repos/" + repositorySlug //$NON-NLS-1$
 				+ "/raw/" + path + "?at=" + commitId; //$NON-NLS-1$ //$NON-NLS-2$
@@ -224,50 +159,9 @@ public class BitbucketClient {
 		return executeGetBinary(url);
 	}
 
-	/**
-	 * Retrieves activities for a pull request, including comments
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param pullRequestId
-	 *            the pull request ID
-	 * @return the JSON response containing activities
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String getPullRequestActivities(@NonNull String projectKey,
-			@NonNull String repositorySlug, long pullRequestId)
-			throws IOException {
-		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
-				+ "/repos/" + repositorySlug //$NON-NLS-1$
-				+ "/pull-requests/" + pullRequestId + "/activities"; //$NON-NLS-1$ //$NON-NLS-2$
-
-		return executeGet(url);
-	}
-
-	/**
-	 * Adds a comment to a pull request, optionally as a reply to an existing
-	 * comment
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param pullRequestId
-	 *            the pull request ID
-	 * @param text
-	 *            the comment text
-	 * @param parentCommentId
-	 *            the parent comment ID for replies, or -1 for top-level
-	 *            comments
-	 * @return the JSON response containing the created comment
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String addPullRequestComment(@NonNull String projectKey,
-			@NonNull String repositorySlug, long pullRequestId,
+	@Override
+	@NonNull
+	public PullRequestComment addComment(long pullRequestId,
 			@NonNull String text, long parentCommentId) throws IOException {
 		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
 				+ "/repos/" + repositorySlug //$NON-NLS-1$
@@ -281,30 +175,38 @@ public class BitbucketClient {
 		}
 		json.append("}"); //$NON-NLS-1$
 
-		return executePost(url, json.toString());
+		String jsonResponse = executePost(url, json.toString());
+		return BitbucketJsonParser.parseSingleComment(jsonResponse);
 	}
 
-	/**
-	 * Updates the severity of a pull request comment (e.g. to create a task)
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param pullRequestId
-	 *            the pull request ID
-	 * @param commentId
-	 *            the comment ID
-	 * @param version
-	 *            the current comment version (for optimistic locking)
-	 * @param severity
-	 *            the new severity ("NORMAL" or "BLOCKER")
-	 * @return the JSON response containing the updated comment
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String updateCommentSeverity(@NonNull String projectKey,
-			@NonNull String repositorySlug, long pullRequestId,
+	@Override
+	@NonNull
+	public PullRequestComment addInlineComment(long pullRequestId,
+			@NonNull String text, @NonNull String path, int line,
+			@NonNull String lineType, @NonNull String fileType,
+			@NonNull String commitId) throws IOException {
+		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
+				+ "/repos/" + repositorySlug //$NON-NLS-1$
+				+ "/pull-requests/" + pullRequestId + "/comments"; //$NON-NLS-1$ //$NON-NLS-2$
+
+		// Build JSON with anchor object
+		StringBuilder json = new StringBuilder();
+		json.append("{\"text\": \"").append(escapeJson(text)).append("\""); //$NON-NLS-1$ //$NON-NLS-2$
+		json.append(", \"anchor\": {"); //$NON-NLS-1$
+		json.append("\"path\": \"").append(escapeJson(path)).append("\""); //$NON-NLS-1$ //$NON-NLS-2$
+		json.append(", \"line\": ").append(line); //$NON-NLS-1$
+		json.append(", \"lineType\": \"").append(lineType).append("\""); //$NON-NLS-1$ //$NON-NLS-2$
+		json.append(", \"fileType\": \"").append(fileType).append("\""); //$NON-NLS-1$ //$NON-NLS-2$
+		json.append("}"); //$NON-NLS-1$
+		json.append("}"); //$NON-NLS-1$
+
+		String jsonResponse = executePost(url, json.toString());
+		return BitbucketJsonParser.parseSingleComment(jsonResponse);
+	}
+
+	@Override
+	@NonNull
+	public PullRequestComment updateCommentSeverity(long pullRequestId,
 			long commentId, int version, @NonNull String severity)
 			throws IOException {
 		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
@@ -315,30 +217,13 @@ public class BitbucketClient {
 		String json = "{\"severity\": \"" + severity + "\", \"version\": " //$NON-NLS-1$ //$NON-NLS-2$
 				+ version + "}"; //$NON-NLS-1$
 
-		return executePut(url, json);
+		String jsonResponse = executePut(url, json);
+		return BitbucketJsonParser.parseSingleComment(jsonResponse);
 	}
 
-	/**
-	 * Updates the state of a pull request comment (e.g. to resolve a task)
-	 *
-	 * @param projectKey
-	 *            the project key
-	 * @param repositorySlug
-	 *            the repository slug
-	 * @param pullRequestId
-	 *            the pull request ID
-	 * @param commentId
-	 *            the comment ID
-	 * @param version
-	 *            the current comment version (for optimistic locking)
-	 * @param state
-	 *            the new state ("OPEN" or "RESOLVED")
-	 * @return the JSON response containing the updated comment
-	 * @throws IOException
-	 *             if the request fails
-	 */
-	public String updateCommentState(@NonNull String projectKey,
-			@NonNull String repositorySlug, long pullRequestId,
+	@Override
+	@NonNull
+	public PullRequestComment updateCommentState(long pullRequestId,
 			long commentId, int version, @NonNull String state)
 			throws IOException {
 		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
@@ -349,8 +234,31 @@ public class BitbucketClient {
 		String json = "{\"state\": \"" + state + "\", \"version\": " //$NON-NLS-1$ //$NON-NLS-2$
 				+ version + "}"; //$NON-NLS-1$
 
-		return executePut(url, json);
+		String jsonResponse = executePut(url, json);
+		return BitbucketJsonParser.parseSingleComment(jsonResponse);
 	}
+
+	@Override
+	public boolean testConnection() {
+		try {
+			String url = serverUrl + API_BASE_PATH + "/application-properties"; //$NON-NLS-1$
+			executeGet(url);
+			return true;
+		} catch (IOException e) {
+			return false;
+		}
+	}
+
+	@Override
+	@NonNull
+	public String getCurrentUser() throws IOException {
+		String url = serverUrl + API_BASE_PATH + "/users/current"; //$NON-NLS-1$
+		String jsonResponse = executeGet(url);
+		// Parse username from response: {"name":"username",...}
+		return BitbucketJsonParser.extractJsonString(jsonResponse, "name"); //$NON-NLS-1$
+	}
+
+
 
 	private static String escapeJson(String text) {
 		return text.replace("\\", "\\\\") //$NON-NLS-1$ //$NON-NLS-2$

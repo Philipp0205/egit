@@ -19,14 +19,19 @@ import java.util.stream.Collectors;
 import org.eclipse.compare.CompareConfiguration;
 import org.eclipse.compare.CompareUI;
 import org.eclipse.compare.CompareViewerPane;
+import org.eclipse.core.resources.IFile;
+import org.eclipse.core.resources.IResource;
+import org.eclipse.core.runtime.IPath;
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
+import org.eclipse.core.runtime.Path;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.jobs.Job;
-import org.eclipse.egit.core.internal.bitbucket.BitbucketClient;
 import org.eclipse.egit.core.internal.bitbucket.ChangedFile;
 import org.eclipse.egit.core.internal.bitbucket.PullRequest;
 import org.eclipse.egit.core.internal.bitbucket.PullRequestComment;
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
+import org.eclipse.egit.core.internal.pullrequest.PullRequestClientFactory;
 import org.eclipse.egit.ui.Activator;
 import org.eclipse.egit.ui.UIPreferences;
 import org.eclipse.egit.ui.UIUtils;
@@ -34,25 +39,26 @@ import org.eclipse.egit.ui.internal.ActionUtils;
 import org.eclipse.egit.ui.internal.PreferenceBasedDateFormatter;
 import org.eclipse.egit.ui.internal.UIIcons;
 import org.eclipse.egit.ui.internal.UIText;
-import org.eclipse.core.resources.IFile;
-import org.eclipse.core.resources.IResource;
-import org.eclipse.core.runtime.IPath;
+import org.eclipse.egit.ui.internal.commit.DiffViewer;
 import org.eclipse.jface.action.Action;
 import org.eclipse.jface.action.IAction;
 import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
+import org.eclipse.jface.action.IToolBarManager;
 import org.eclipse.jface.action.MenuManager;
 import org.eclipse.jface.action.Separator;
-import org.eclipse.jface.action.IToolBarManager;
 import org.eclipse.jface.dialogs.DialogSettings;
 import org.eclipse.jface.dialogs.IDialogSettings;
 import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.layout.GridDataFactory;
 import org.eclipse.jface.layout.GridLayoutFactory;
 import org.eclipse.jface.layout.TreeColumnLayout;
+import org.eclipse.jface.preference.IPreferenceStore;
+import org.eclipse.jface.preference.PreferenceConverter;
 import org.eclipse.jface.resource.JFaceResources;
 import org.eclipse.jface.resource.LocalResourceManager;
 import org.eclipse.jface.resource.ResourceManager;
+import org.eclipse.jface.util.IPropertyChangeListener;
 import org.eclipse.jface.viewers.ColumnLabelProvider;
 import org.eclipse.jface.viewers.ColumnWeightData;
 import org.eclipse.jface.viewers.DoubleClickEvent;
@@ -65,23 +71,26 @@ import org.eclipse.jface.viewers.StructuredSelection;
 import org.eclipse.jface.viewers.TreeViewer;
 import org.eclipse.jface.viewers.TreeViewerColumn;
 import org.eclipse.jface.viewers.Viewer;
+import org.eclipse.jgit.lib.Repository;
 import org.eclipse.swt.SWT;
 import org.eclipse.swt.custom.SashForm;
 import org.eclipse.swt.dnd.Clipboard;
 import org.eclipse.swt.dnd.TextTransfer;
 import org.eclipse.swt.dnd.Transfer;
+import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Image;
+import org.eclipse.swt.graphics.RGB;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Control;
 import org.eclipse.swt.widgets.Display;
-import org.eclipse.ui.PartInitException;
 import org.eclipse.ui.actions.ActionFactory;
+import org.eclipse.ui.editors.text.EditorsUI;
 import org.eclipse.ui.forms.widgets.Form;
 import org.eclipse.ui.forms.widgets.FormToolkit;
-import org.eclipse.ui.ide.IDE;
 import org.eclipse.ui.part.IShowInSource;
 import org.eclipse.ui.part.ShowInContext;
 import org.eclipse.ui.part.ViewPart;
+import org.eclipse.ui.texteditor.AbstractTextEditor;
 
 /**
  * View for displaying Bitbucket Data Center pull requests
@@ -149,6 +158,10 @@ public class PullRequestsView extends ViewPart {
 
 	private Composite commentsPanel;
 
+	private Color commentedLineHighlightColor;
+
+	private IPropertyChangeListener editorPropertyChangeListener;
+
 	private Job currentLoadCompareJob;
 
 	@Override
@@ -158,6 +171,27 @@ public class PullRequestsView extends ViewPart {
 
 		toolkit = new FormToolkit(parent.getDisplay());
 		parent.addDisposeListener(e -> toolkit.dispose());
+
+		// Initialize highlight color from Eclipse editor selection preference
+		updateCommentedLineHighlightColor();
+		parent.addDisposeListener(e -> {
+			if (commentedLineHighlightColor != null
+					&& !commentedLineHighlightColor.isDisposed()) {
+				commentedLineHighlightColor.dispose();
+			}
+		});
+
+		// Listen for changes to editor selection background color preference
+		editorPropertyChangeListener = event -> {
+			if (AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND
+					.equals(event.getProperty())
+					|| AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND_SYSTEM_DEFAULT
+							.equals(event.getProperty())) {
+				updateCommentedLineHighlightColor();
+			}
+		};
+		EditorsUI.getPreferenceStore()
+				.addPropertyChangeListener(editorPropertyChangeListener);
 
 		form = toolkit.createForm(parent);
 		form.setText("Pull Requests"); //$NON-NLS-1$
@@ -320,7 +354,7 @@ public class PullRequestsView extends ViewPart {
 
 		createActions();
 		contributeToActionBars();
-		
+
 		// Automatically refresh pull requests when view opens
 		refreshPullRequests();
 	}
@@ -375,45 +409,28 @@ public class PullRequestsView extends ViewPart {
 	}
 
 	private void refreshPullRequests() {
-		// Get configuration from preferences
-		final String serverUrl = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_SERVER_URL);
-		final String token = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
-		final String projectKey = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_PROJECT_KEY);
-		final String repoSlug = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_REPO_SLUG);
-		final String username = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_USERNAME);
-
-		if (serverUrl.isEmpty() || token.isEmpty() || projectKey.isEmpty()
-				|| repoSlug.isEmpty()) {
-			form.setText("Pull Requests - Not configured"); //$NON-NLS-1$
-			return;
-		}
-
 		Job job = new Job("Fetching pull requests") { //$NON-NLS-1$
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
-				monitor.beginTask("Fetching pull requests from Bitbucket", //$NON-NLS-1$
+				monitor.beginTask("Fetching pull requests", //$NON-NLS-1$
 						IProgressMonitor.UNKNOWN);
 
-				System.out.println("Starting pull request fetch job"); //$NON-NLS-1$
-				try {
-					BitbucketClient client = new BitbucketClient(serverUrl,
-							token);
+			try {
+				// Create client using factory (supports both Bitbucket and GitHub)
+				IPullRequestClient client = PullRequestClientFactory.createClient();
+
+				if (client == null) {
+					Display.getDefault().asyncExec(() -> {
+						form.setText("Pull Requests - Not configured"); //$NON-NLS-1$
+					});
+					return Status.OK_STATUS;
+				}
+
+				// Get username from client for filtering
+				final String username = client.getCurrentUser();
 
 				// Always use the latest username from preferences
 				currentUsername = username;
-				if (!currentUsername.isEmpty()) {
-					System.out.println(
-							"Using configured username: " //$NON-NLS-1$
-									+ currentUsername);
-				} else {
-					System.out.println(
-							"Username not configured - showing all PRs"); //$NON-NLS-1$
-				}
 
 				// Fetch PRs - filter by author (current user) unless "Show All" is checked
 				// If username is not configured, we'll show all PRs (authorFilter = null)
@@ -422,27 +439,8 @@ public class PullRequestsView extends ViewPart {
 						|| currentUsername.isEmpty()) ? null
 								: currentUsername;
 
-					System.out.println("showAllPRs: " + showAllPRs); //$NON-NLS-1$
-					System.out.println("authorFilter: " + authorFilter); //$NON-NLS-1$
-
-					String jsonResponse = client.getPullRequests(projectKey,
-							repoSlug, "OPEN", authorFilter, null, 100, 0); //$NON-NLS-1$
-
-				// Parse JSON response to populate pullRequests list
-				List<PullRequest> fetchedPRs = parsePullRequests(
-						jsonResponse);
-
-					// Debug: Log all unique author usernames found
-					System.out.println("Found " + fetchedPRs.size() //$NON-NLS-1$
-							+ " PRs. Unique authors:"); //$NON-NLS-1$
-					fetchedPRs.stream()
-							.filter(pr -> pr.getAuthor() != null
-									&& pr.getAuthor().getUser() != null)
-							.map(pr -> pr.getAuthor().getUser().getName()
-									+ " (" //$NON-NLS-1$
-									+ pr.getAuthor().getUser().getDisplayName()
-									+ ")") //$NON-NLS-1$
-							.distinct().forEach(System.out::println);
+			List<PullRequest> fetchedPRs = client.getPullRequests(
+					"OPEN", authorFilter, null, 100, 0); //$NON-NLS-1$
 
 					final String filterInfo;
 					if (showAllPRs) {
@@ -475,396 +473,12 @@ public class PullRequestsView extends ViewPart {
 				}
 			}
 		};
-		job.setUser(true);
-		job.schedule();
-	}
-
-	private List<PullRequest> parsePullRequests(String json) {
-		List<PullRequest> result = new ArrayList<>();
-
-		// Find the "values" array in the response
-		int valuesStart = json.indexOf("\"values\":"); //$NON-NLS-1$
-		if (valuesStart == -1) {
-			return result;
-		}
-
-		// Find the opening bracket of the values array
-		int arrayStart = json.indexOf('[', valuesStart);
-		if (arrayStart == -1) {
-			return result;
-		}
-
-		// Parse each pull request object in the array
-		int pos = arrayStart + 1;
-		while (pos < json.length()) {
-			// Skip whitespace
-			while (pos < json.length() && Character.isWhitespace(json.charAt(pos))) {
-				pos++;
-			}
-
-			if (pos >= json.length() || json.charAt(pos) == ']') {
-				break;
-			}
-
-			// Find the opening brace of the PR object
-			if (json.charAt(pos) == '{') {
-				int objEnd = findMatchingBrace(json, pos);
-				if (objEnd == -1) {
-					break;
-				}
-
-				String prJson = json.substring(pos, objEnd + 1);
-				PullRequest pr = parseSinglePullRequest(prJson);
-				if (pr != null) {
-					result.add(pr);
-				}
-
-				pos = objEnd + 1;
-				// Skip comma if present
-				while (pos < json.length() && (Character.isWhitespace(json.charAt(pos)) || json.charAt(pos) == ',')) {
-					pos++;
-				}
-			} else {
-				pos++;
-			}
-		}
-
-		return result;
-	}
-
-	private int findMatchingBrace(String json, int startPos) {
-		int depth = 0;
-		boolean inString = false;
-		boolean escape = false;
-
-		for (int i = startPos; i < json.length(); i++) {
-			char c = json.charAt(i);
-
-			if (escape) {
-				escape = false;
-				continue;
-			}
-
-			if (c == '\\') {
-				escape = true;
-				continue;
-			}
-
-			if (c == '"') {
-				inString = !inString;
-				continue;
-			}
-
-			if (!inString) {
-				if (c == '{') {
-					depth++;
-				} else if (c == '}') {
-					depth--;
-					if (depth == 0) {
-						return i;
-					}
-				}
-			}
-		}
-
-		return -1;
-	}
-
-	private PullRequest parseSinglePullRequest(String json) {
-		PullRequest pr = new PullRequest();
-
-		// Parse id
-		Long id = extractLongValue(json, "\"id\":"); //$NON-NLS-1$
-		if (id != null) {
-			pr.setId(id.longValue());
-		}
-
-		// Parse version
-		Integer version = extractIntValue(json, "\"version\":"); //$NON-NLS-1$
-		if (version != null) {
-			pr.setVersion(version.intValue());
-		}
-
-		// Parse title
-		String title = extractStringValue(json, "\"title\":"); //$NON-NLS-1$
-		if (title != null) {
-			pr.setTitle(title);
-		}
-
-		// Parse description
-		String description = extractStringValue(json, "\"description\":"); //$NON-NLS-1$
-		if (description != null) {
-			pr.setDescription(description);
-		}
-
-		// Parse state
-		String state = extractStringValue(json, "\"state\":"); //$NON-NLS-1$
-		if (state != null) {
-			pr.setState(state);
-		}
-
-		// Parse open
-		Boolean open = extractBooleanValue(json, "\"open\":"); //$NON-NLS-1$
-		if (open != null) {
-			pr.setOpen(open.booleanValue());
-		}
-
-		// Parse closed
-		Boolean closed = extractBooleanValue(json, "\"closed\":"); //$NON-NLS-1$
-		if (closed != null) {
-			pr.setClosed(closed.booleanValue());
-		}
-
-		// Parse createdDate
-		Long createdDate = extractLongValue(json, "\"createdDate\":"); //$NON-NLS-1$
-		if (createdDate != null) {
-			pr.setCreatedDate(new java.util.Date(createdDate.longValue()));
-		}
-
-		// Parse updatedDate
-		Long updatedDate = extractLongValue(json, "\"updatedDate\":"); //$NON-NLS-1$
-		if (updatedDate != null) {
-			pr.setUpdatedDate(new java.util.Date(updatedDate.longValue()));
-		}
-
-		// Parse fromRef
-		String fromRefJson = extractObjectValue(json, "\"fromRef\":"); //$NON-NLS-1$
-		if (fromRefJson != null) {
-			pr.setFromRef(parseRef(fromRefJson));
-		}
-
-		// Parse toRef
-		String toRefJson = extractObjectValue(json, "\"toRef\":"); //$NON-NLS-1$
-		if (toRefJson != null) {
-			pr.setToRef(parseRef(toRefJson));
-		}
-
-		// Parse author
-		String authorJson = extractObjectValue(json, "\"author\":"); //$NON-NLS-1$
-		if (authorJson != null) {
-			pr.setAuthor(parseParticipant(authorJson));
-		}
-
-		// Parse comment count from properties
-		String propertiesJson = extractObjectValue(json, "\"properties\":"); //$NON-NLS-1$
-		if (propertiesJson != null) {
-			Integer commentCount = extractIntValue(propertiesJson, "\"commentCount\":"); //$NON-NLS-1$
-			if (commentCount != null) {
-				pr.setCommentCount(commentCount.intValue());
-			}
-		}
-
-		return pr;
-	}
-
-	private PullRequest.PullRequestRef parseRef(String json) {
-		PullRequest.PullRequestRef ref = new PullRequest.PullRequestRef();
-
-		String id = extractStringValue(json, "\"id\":"); //$NON-NLS-1$
-		if (id != null) {
-			ref.setId(id);
-		}
-
-		String displayId = extractStringValue(json, "\"displayId\":"); //$NON-NLS-1$
-		if (displayId != null) {
-			ref.setDisplayId(displayId);
-		}
-
-		String repoJson = extractObjectValue(json, "\"repository\":"); //$NON-NLS-1$
-		if (repoJson != null) {
-			ref.setRepository(parseRepository(repoJson));
-		}
-
-		return ref;
-	}
-
-	private PullRequest.Repository parseRepository(String json) {
-		PullRequest.Repository repo = new PullRequest.Repository();
-
-		String slug = extractStringValue(json, "\"slug\":"); //$NON-NLS-1$
-		if (slug != null) {
-			repo.setSlug(slug);
-		}
-
-		String name = extractStringValue(json, "\"name\":"); //$NON-NLS-1$
-		if (name != null) {
-			repo.setName(name);
-		}
-
-		String projectJson = extractObjectValue(json, "\"project\":"); //$NON-NLS-1$
-		if (projectJson != null) {
-			repo.setProject(parseProject(projectJson));
-		}
-
-		return repo;
-	}
-
-	private PullRequest.Project parseProject(String json) {
-		PullRequest.Project project = new PullRequest.Project();
-
-		String key = extractStringValue(json, "\"key\":"); //$NON-NLS-1$
-		if (key != null) {
-			project.setKey(key);
-		}
-
-		String name = extractStringValue(json, "\"name\":"); //$NON-NLS-1$
-		if (name != null) {
-			project.setName(name);
-		}
-
-		return project;
-	}
-
-	private PullRequest.PullRequestParticipant parseParticipant(String json) {
-		PullRequest.PullRequestParticipant participant = new PullRequest.PullRequestParticipant();
-
-		String userJson = extractObjectValue(json, "\"user\":"); //$NON-NLS-1$
-		if (userJson != null) {
-			participant.setUser(parseUser(userJson));
-		}
-
-		String role = extractStringValue(json, "\"role\":"); //$NON-NLS-1$
-		if (role != null) {
-			participant.setRole(role);
-		}
-
-		Boolean approved = extractBooleanValue(json, "\"approved\":"); //$NON-NLS-1$
-		if (approved != null) {
-			participant.setApproved(approved.booleanValue());
-		}
-
-		return participant;
-	}
-
-	private PullRequest.User parseUser(String json) {
-		PullRequest.User user = new PullRequest.User();
-
-		String name = extractStringValue(json, "\"name\":"); //$NON-NLS-1$
-		if (name != null) {
-			user.setName(name);
-		}
-
-		String emailAddress = extractStringValue(json, "\"emailAddress\":"); //$NON-NLS-1$
-		if (emailAddress != null) {
-			user.setEmailAddress(emailAddress);
-		}
-
-		String displayName = extractStringValue(json, "\"displayName\":"); //$NON-NLS-1$
-		if (displayName != null) {
-			user.setDisplayName(displayName);
-		}
-
-		return user;
-	}
-
-	private String extractStringValue(String json, String key) {
-		int keyPos = json.indexOf(key);
-		if (keyPos == -1) {
-			return null;
-		}
-
-		int valueStart = json.indexOf('"', keyPos + key.length());
-		if (valueStart == -1) {
-			return null;
-		}
-
-		int valueEnd = valueStart + 1;
-		boolean escape = false;
-		while (valueEnd < json.length()) {
-			char c = json.charAt(valueEnd);
-			if (escape) {
-				escape = false;
-				valueEnd++;
-				continue;
-			}
-			if (c == '\\') {
-				escape = true;
-				valueEnd++;
-				continue;
-			}
-			if (c == '"') {
-				return json.substring(valueStart + 1, valueEnd);
-			}
-			valueEnd++;
-		}
-
-		return null;
-	}
-
-	private Long extractLongValue(String json, String key) {
-		int keyPos = json.indexOf(key);
-		if (keyPos == -1) {
-			return null;
-		}
-
-		int valueStart = keyPos + key.length();
-		while (valueStart < json.length() && Character.isWhitespace(json.charAt(valueStart))) {
-			valueStart++;
-		}
-
-		int valueEnd = valueStart;
-		while (valueEnd < json.length() && (Character.isDigit(json.charAt(valueEnd)) || json.charAt(valueEnd) == '-')) {
-			valueEnd++;
-		}
-
-		if (valueEnd > valueStart) {
-			try {
-				return Long.valueOf(json.substring(valueStart, valueEnd));
-			} catch (NumberFormatException e) {
-				return null;
-			}
-		}
-
-		return null;
-	}
-
-	private Integer extractIntValue(String json, String key) {
-		Long value = extractLongValue(json, key);
-		return value != null ? Integer.valueOf(value.intValue()) : null;
-	}
-
-	private Boolean extractBooleanValue(String json, String key) {
-		int keyPos = json.indexOf(key);
-		if (keyPos == -1) {
-			return null;
-		}
-
-		int valueStart = keyPos + key.length();
-		while (valueStart < json.length() && Character.isWhitespace(json.charAt(valueStart))) {
-			valueStart++;
-		}
-
-		if (json.startsWith("true", valueStart)) { //$NON-NLS-1$
-			return Boolean.TRUE;
-		} else if (json.startsWith("false", valueStart)) { //$NON-NLS-1$
-			return Boolean.FALSE;
-		}
-
-		return null;
-	}
-
-	private String extractObjectValue(String json, String key) {
-		int keyPos = json.indexOf(key);
-		if (keyPos == -1) {
-			return null;
-		}
-
-		int objectStart = json.indexOf('{', keyPos + key.length());
-		if (objectStart == -1) {
-			return null;
-		}
-
-		int objectEnd = findMatchingBrace(json, objectStart);
-		if (objectEnd == -1) {
-			return null;
-		}
-
-		return json.substring(objectStart, objectEnd + 1);
-	}
-
-	private void onPullRequestDoubleClick(PullRequest pr) {
+	job.setUser(true);
+	job.schedule();
+}
+
+private void onPullRequestDoubleClick(PullRequest pr) {
 		selectedPullRequest = pr;
-		System.out.println("Double-clicked PR #" + pr.getId() + ": " + pr.getTitle()); //$NON-NLS-1$ //$NON-NLS-2$
 
 		// Fetch changed files in a background job
 		Job job = new Job("Fetching changed files") { //$NON-NLS-1$
@@ -873,66 +487,40 @@ public class PullRequestsView extends ViewPart {
 				monitor.beginTask("Fetching changed files from Bitbucket", //$NON-NLS-1$
 						IProgressMonitor.UNKNOWN);
 
+			try {
+				// Create client using factory (supports both Bitbucket and GitHub)
+				IPullRequestClient client = PullRequestClientFactory.createClient();
+
+				if (client == null) {
+					Activator.logError("Failed to create pull request client", null); //$NON-NLS-1$
+					return Status.CANCEL_STATUS;
+				}
+
+				// Fetch changed files
+				List<ChangedFile> apiChangedFiles = client.getPullRequestChanges(pr.getId());
+
+				final List<PullRequestChangedFile> uiChangedFiles = apiChangedFiles
+						.stream()
+						.map(PullRequestChangedFile::fromChangedFile)
+						.collect(Collectors.toList());
+
+				// Fetch pull request activities (including comments)
+				final List<PullRequestComment> comments = new ArrayList<>();
 				try {
-					final String serverUrl = Activator.getDefault()
-							.getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_SERVER_URL);
-					final String token = Activator.getDefault()
-							.getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
+				comments.addAll(client.getPullRequestComments(pr.getId()));
+				} catch (Exception e) {
+					Activator.logError("Failed to fetch pull request comments", e); //$NON-NLS-1$
+				}
 
-					System.out.println("Fetching changes for PR #" + pr.getId()); //$NON-NLS-1$
-					BitbucketClient client = new BitbucketClient(serverUrl,
-							token);
-
-					String projectKey = pr.getToRef().getRepository()
-							.getProject().getKey();
-					String repoSlug = pr.getToRef().getRepository().getSlug();
-
-					System.out.println("Project: " + projectKey + ", Repo: " + repoSlug); //$NON-NLS-1$ //$NON-NLS-2$
-
-					// Fetch changed files
-					String jsonResponse = client.getPullRequestChanges(
-							projectKey, repoSlug, pr.getId());
-
-					System.out.println("Got JSON response, length: " + jsonResponse.length()); //$NON-NLS-1$
-
-					List<ChangedFile> apiChangedFiles = parseChangedFiles(
-							jsonResponse);
-					System.out.println("Parsed " + apiChangedFiles.size() + " changed files"); //$NON-NLS-1$ //$NON-NLS-2$
-
-					final List<PullRequestChangedFile> uiChangedFiles = apiChangedFiles
-							.stream()
-							.map(PullRequestChangedFile::fromChangedFile)
-							.collect(Collectors.toList());
-
-					System.out.println("Converted to " + uiChangedFiles.size() + " UI changed files"); //$NON-NLS-1$ //$NON-NLS-2$
-
-					// Fetch pull request activities (including comments)
-					final List<PullRequestComment> comments = new ArrayList<>();
-					try {
-						System.out.println("Fetching activities for PR #" + pr.getId()); //$NON-NLS-1$
-						String activitiesJson = client.getPullRequestActivities(
-								projectKey, repoSlug, pr.getId());
-						System.out.println("Got activities JSON, length: " + activitiesJson.length()); //$NON-NLS-1$
-						
-						comments.addAll(parseActivities(activitiesJson));
-						System.out.println("Parsed " + comments.size() + " comments"); //$NON-NLS-1$ //$NON-NLS-2$
-					} catch (Exception e) {
-						System.err.println("Failed to fetch/parse activities: " + e.getMessage()); //$NON-NLS-1$
-						e.printStackTrace();
+				Display.getDefault().asyncExec(() -> {
+					if (!pullRequestViewer.getControl().isDisposed()) {
+						changedFiles.clear();
+						changedFiles.addAll(uiChangedFiles);
+						allComments.clear();
+						allComments.addAll(comments);
+						switchToChangesView();
 					}
-
-					Display.getDefault().asyncExec(() -> {
-						if (!pullRequestViewer.getControl().isDisposed()) {
-							changedFiles.clear();
-							changedFiles.addAll(uiChangedFiles);
-							allComments.clear();
-							allComments.addAll(comments);
-							System.out.println("Switching to changes view with " + changedFiles.size() + " files and " + allComments.size() + " comments"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
-							switchToChangesView();
-						}
-					});
+				});
 
 					return Status.OK_STATUS;
 				} catch (IOException e) {
@@ -954,144 +542,7 @@ public class PullRequestsView extends ViewPart {
 		job.schedule();
 	}
 
-	private List<ChangedFile> parseChangedFiles(String json) {
-		System.out.println("parseChangedFiles() called, json length: " + json.length()); //$NON-NLS-1$
-		List<ChangedFile> result = new ArrayList<>();
-
-		// Find the "values" array in the response
-		int valuesStart = json.indexOf("\"values\":"); //$NON-NLS-1$
-		if (valuesStart == -1) {
-			System.out.println("No 'values' array found in JSON"); //$NON-NLS-1$
-			return result;
-		}
-
-		// Find the opening bracket of the values array
-		int arrayStart = json.indexOf('[', valuesStart);
-		if (arrayStart == -1) {
-			System.out.println("No array start '[' found"); //$NON-NLS-1$
-			return result;
-		}
-
-		// Parse each changed file object in the array
-		int pos = arrayStart + 1;
-		while (pos < json.length()) {
-			// Skip whitespace
-			while (pos < json.length()
-					&& Character.isWhitespace(json.charAt(pos))) {
-				pos++;
-			}
-
-			if (pos >= json.length() || json.charAt(pos) == ']') {
-				break;
-			}
-
-			// Find the opening brace of the changed file object
-			if (json.charAt(pos) == '{') {
-				int objEnd = findMatchingBrace(json, pos);
-				if (objEnd == -1) {
-					break;
-				}
-
-				String changedFileJson = json.substring(pos, objEnd + 1);
-				ChangedFile cf = parseSingleChangedFile(changedFileJson);
-				if (cf != null) {
-					result.add(cf);
-				}
-
-				pos = objEnd + 1;
-				// Skip comma if present
-				while (pos < json.length() && (Character.isWhitespace(
-						json.charAt(pos)) || json.charAt(pos) == ',')) {
-					pos++;
-				}
-			} else {
-				pos++;
-			}
-		}
-
-		System.out.println("parseChangedFiles() completed, found " + result.size() + " files"); //$NON-NLS-1$ //$NON-NLS-2$
-		return result;
-	}
-
-	private ChangedFile parseSingleChangedFile(String json) {
-		ChangedFile cf = new ChangedFile();
-
-		// Parse type (ADD, MODIFY, DELETE, MOVE, COPY)
-		String type = extractStringValue(json, "\"type\":"); //$NON-NLS-1$
-		if (type != null) {
-			cf.setType(type);
-		}
-
-		// Parse path
-		String pathJson = extractObjectValue(json, "\"path\":"); //$NON-NLS-1$
-		if (pathJson != null) {
-			cf.setPath(parsePath(pathJson));
-		}
-
-		// Parse srcPath (for MOVE/COPY operations)
-		String srcPathJson = extractObjectValue(json, "\"srcPath\":"); //$NON-NLS-1$
-		if (srcPathJson != null) {
-			cf.setSrcPath(parsePath(srcPathJson));
-		}
-
-		return cf;
-	}
-
-	private ChangedFile.Path parsePath(String json) {
-		ChangedFile.Path path = new ChangedFile.Path();
-
-		// Parse toString
-		String toStringValue = extractStringValue(json, "\"toString\":"); //$NON-NLS-1$
-		if (toStringValue != null) {
-			path.setToString(toStringValue);
-		}
-
-		// Parse name
-		String name = extractStringValue(json, "\"name\":"); //$NON-NLS-1$
-		if (name != null) {
-			path.setName(name);
-		}
-
-		// Parse extension
-		String extension = extractStringValue(json, "\"extension\":"); //$NON-NLS-1$
-		if (extension != null) {
-			path.setExtension(extension);
-		}
-
-		// Parse components array
-		List<String> components = new ArrayList<>();
-		String componentsJson = json.substring(
-				json.indexOf("\"components\":")); //$NON-NLS-1$
-		int arrayStart = componentsJson.indexOf('[');
-		if (arrayStart != -1) {
-			int arrayEnd = componentsJson.indexOf(']', arrayStart);
-			if (arrayEnd != -1) {
-				String arrayContent = componentsJson.substring(arrayStart + 1,
-						arrayEnd);
-				// Simple string array parser
-				int compPos = 0;
-				while (compPos < arrayContent.length()) {
-					int quoteStart = arrayContent.indexOf('"', compPos);
-					if (quoteStart == -1) {
-						break;
-					}
-					int quoteEnd = arrayContent.indexOf('"', quoteStart + 1);
-					if (quoteEnd == -1) {
-						break;
-					}
-					components.add(
-							arrayContent.substring(quoteStart + 1, quoteEnd));
-					compPos = quoteEnd + 1;
-				}
-			}
-		}
-		path.setComponents(components);
-
-		return path;
-	}
-
 	private void switchToChangesView() {
-		System.out.println("switchToChangesView() called, mode changing to CHANGES_VIEW"); //$NON-NLS-1$
 		currentMode = ViewMode.CHANGES_VIEW;
 
 		// Dispose the existing tree viewer and layout
@@ -1116,15 +567,12 @@ public class PullRequestsView extends ViewPart {
 		pullRequestViewer.getTree().setLinesVisible(true);
 
 		// Set up changed files columns
-		System.out.println("Setting up changed files columns"); //$NON-NLS-1$
 		setupChangedFilesColumns();
 
 		// Set content provider
-		System.out.println("Setting content provider"); //$NON-NLS-1$
 		pullRequestViewer.setContentProvider(new PullRequestChangesContentProvider());
 
 		// Set input
-		System.out.println("Setting input with " + changedFiles.size() + " changed files"); //$NON-NLS-1$ //$NON-NLS-2$
 		pullRequestViewer.setInput(changedFiles);
 
 		// Add file selection listener
@@ -1330,13 +778,13 @@ public class PullRequestsView extends ViewPart {
 				}
 				return false;
 			}
-		});
+	});
 
-		// Set empty input initially
-		commentsViewer.setInput(new ArrayList<PullRequestComment>());
+	// Set empty input initially
+	commentsViewer.setInput(new ArrayList<>());
 
-		// Add double-click listener to scroll to comment line
-		commentsViewer.addDoubleClickListener(event -> {
+	// Add double-click listener to scroll to comment line
+	commentsViewer.addDoubleClickListener(event -> {
 			IStructuredSelection selection = (IStructuredSelection) event.getSelection();
 			if (!selection.isEmpty()) {
 				Object element = selection.getFirstElement();
@@ -1475,7 +923,6 @@ public class PullRequestsView extends ViewPart {
 	}
 
 	private void setupChangedFilesColumns() {
-		System.out.println("setupChangedFilesColumns() called"); //$NON-NLS-1$
 		// File Column - explicitly set label provider for icons and file names
 		TreeViewerColumn fileColumn = createColumn(treeColumnLayout, "File", //$NON-NLS-1$
 				60, SWT.LEFT);
@@ -1530,7 +977,6 @@ public class PullRequestsView extends ViewPart {
 				return ""; //$NON-NLS-1$
 			}
 		});
-		System.out.println("setupChangedFilesColumns() completed - created 4 columns"); //$NON-NLS-1$
 	}
 
 	private void setupPRListColumns() {
@@ -1676,21 +1122,21 @@ public class PullRequestsView extends ViewPart {
 				try {
 					monitor.beginTask("Preparing comparison", IProgressMonitor.UNKNOWN); //$NON-NLS-1$
 
-					// Check if job was cancelled
-					if (monitor.isCanceled()) {
-						return Status.CANCEL_STATUS;
-					}
+				// Check if job was cancelled
+				if (monitor.isCanceled()) {
+					return Status.CANCEL_STATUS;
+				}
 
-					// Get Bitbucket client
-					final String serverUrl = Activator.getDefault().getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_SERVER_URL);
-					final String token = Activator.getDefault().getPreferenceStore()
-							.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
+			// Get pull request client
+			IPullRequestClient client = PullRequestClientFactory.createClient();
 
-					BitbucketClient client = new BitbucketClient(serverUrl, token);
+			if (client == null) {
+				Activator.logError("Failed to create pull request client", null); //$NON-NLS-1$
+				return Status.CANCEL_STATUS;
+			}
 
 					// Create compare configuration
-					final CompareConfiguration config = BitbucketCompareEditorInput
+					final CompareConfiguration config = PullRequestCompareEditorInput
 							.createCompareConfiguration(selectedPullRequest, file);
 
 					// Check if job was cancelled before creating compare input
@@ -1702,7 +1148,7 @@ public class PullRequestsView extends ViewPart {
 					}
 
 					// Create compare input
-					final Object compareInput = BitbucketCompareEditorInput
+					final Object compareInput = PullRequestCompareEditorInput
 							.createCompareInput(client, selectedPullRequest, file, monitor);
 
 					// Check if job was cancelled after creating compare input
@@ -1763,12 +1209,34 @@ public class PullRequestsView extends ViewPart {
 								.getPreferenceStore().getBoolean(
 										UIPreferences.PULLREQUEST_SHOW_INLINE_COMMENTS);
 
+						// Filter comments for selected file (needed before creating viewer)
+						List<PullRequestComment> fileComments = allComments.stream()
+								.filter(comment -> {
+									if (comment.getPath() == null) {
+										return false; // Skip general/file-level comments
+									}
+									String commentPath = comment.getPath();
+									String filePath = file.getPath();
+									// Handle MOVE/COPY where srcPath might be relevant
+									String srcPath = file.getSrcPath();
+										return commentPath.equals(filePath)
+											|| (srcPath != null && commentPath.equals(srcPath));
+								})
+							.collect(Collectors.toList());
+
 						InlineCommentTextMergeViewer inlineMergeViewer = null;
+							System.out.println(
+									"[PullRequestsView] Creating inline comment merge viewer"); //$NON-NLS-1$
 						if (useInlineComments) {
 							inlineMergeViewer = new InlineCommentTextMergeViewer(
 									compareViewerPane,
 									compareConfiguration);
 							compareViewer = inlineMergeViewer;
+							// CRITICAL: Set comments BEFORE setInput() so they're queued as pending
+							// when updateContent() fires during setInput()
+							if (!fileComments.isEmpty()) {
+								inlineMergeViewer.setComments(fileComments);
+							}
 						} else {
 							compareViewer = CompareUI
 									.findContentViewer(null,
@@ -1785,40 +1253,19 @@ public class PullRequestsView extends ViewPart {
 
 							// Restore vertical sash weights (compare viewer + comments panel)
 							rightSashForm.setWeights(new int[] { 70, 30 });
-							
+
 							// Restore horizontal sash weights (files + right pane)
 							int[] weights = restoreSashWeights();
 							changesSashForm.setWeights(weights);
-							
+
 							// Force layout
 							rightSashForm.layout(true, true);
 							changesSashForm.layout(true, true);
 
-							// Filter and display comments for selected file
+							// Display comments in comments panel
 							if (commentsViewer != null && !commentsViewer.getControl().isDisposed()) {
-								List<PullRequestComment> fileComments = allComments.stream()
-										.filter(comment -> {
-											if (comment.getPath() == null) {
-												return false; // Skip general/file-level comments
-											}
-											String commentPath = comment.getPath();
-											String filePath = file.getPath();
-											// Handle MOVE/COPY where srcPath might be relevant
-											String srcPath = file.getSrcPath();
-											return commentPath.equals(filePath) 
-													|| (srcPath != null && commentPath.equals(srcPath));
-										})
-									.collect(Collectors.toList());
 							commentsViewer.setInput(fileComments);
 								commentsViewer.refresh();
-
-							// Apply inline comment annotations if enabled
-							if (useInlineComments
-									&& inlineMergeViewer != null
-									&& !fileComments.isEmpty()) {
-								inlineMergeViewer
-										.setComments(fileComments);
-							}
 
 								// Apply line highlighting for commented lines
 								// (skip when inline annotations are active
@@ -1861,11 +1308,45 @@ public class PullRequestsView extends ViewPart {
 		pullRequestViewer.getControl().setFocus();
 	}
 
+	/**
+	 * Updates the highlighted color for commented lines from Eclipse editor
+	 * selection background preference. Disposes the old color if it exists and
+	 * creates a new one.
+	 */
+	private void updateCommentedLineHighlightColor() {
+		// Dispose old color if it exists
+		if (commentedLineHighlightColor != null
+				&& !commentedLineHighlightColor.isDisposed()) {
+			commentedLineHighlightColor.dispose();
+		}
+
+		// Get the selection background color from Eclipse editor preferences
+		IPreferenceStore store = EditorsUI.getPreferenceStore();
+		boolean useSystemDefault = store.getBoolean(
+				AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND_SYSTEM_DEFAULT);
+
+		if (useSystemDefault) {
+			// Use system default selection color
+			commentedLineHighlightColor = Display.getDefault()
+					.getSystemColor(SWT.COLOR_LIST_SELECTION);
+		} else {
+			// Use custom color from preferences
+			RGB rgb = PreferenceConverter.getColor(store,
+					AbstractTextEditor.PREFERENCE_COLOR_SELECTION_BACKGROUND);
+			commentedLineHighlightColor = new Color(rgb);
+		}
+	}
+
 	@Override
 	public void dispose() {
 		// Cancel any pending load job
 		if (currentLoadCompareJob != null) {
 			currentLoadCompareJob.cancel();
+		}
+		if (editorPropertyChangeListener != null) {
+			EditorsUI.getPreferenceStore()
+					.removePropertyChangeListener(editorPropertyChangeListener);
+			editorPropertyChangeListener = null;
 		}
 		if (compareConfiguration != null) {
 			compareConfiguration.dispose();
@@ -1986,262 +1467,6 @@ public class PullRequestsView extends ViewPart {
 	}
 
 	/**
-	 * Parses pull request activities from JSON response and extracts comments
-	 *
-	 * @param json
-	 *            the JSON response from /activities endpoint
-	 * @return list of PullRequestComment objects
-	 */
-	private List<org.eclipse.egit.core.internal.bitbucket.PullRequestComment> parseActivities(
-			String json) {
-		List<org.eclipse.egit.core.internal.bitbucket.PullRequestComment> result = new ArrayList<>();
-
-		// Find the "values" array
-		int valuesStart = json.indexOf("\"values\":"); //$NON-NLS-1$
-		if (valuesStart == -1) {
-			return result;
-		}
-
-		int arrayStart = json.indexOf('[', valuesStart);
-		if (arrayStart == -1) {
-			return result;
-		}
-
-		// Parse each activity object
-		int pos = arrayStart + 1;
-		while (pos < json.length()) {
-			while (pos < json.length()
-					&& Character.isWhitespace(json.charAt(pos))) {
-				pos++;
-			}
-
-			if (pos >= json.length() || json.charAt(pos) == ']') {
-				break;
-			}
-
-			if (json.charAt(pos) == '{') {
-				int objEnd = findMatchingBrace(json, pos);
-				if (objEnd == -1) {
-					break;
-				}
-
-				String activityJson = json.substring(pos, objEnd + 1);
-
-				// Check if this is a COMMENTED action
-				String action = extractStringValue(activityJson, "\"action\":"); //$NON-NLS-1$
-				if ("COMMENTED".equals(action)) { //$NON-NLS-1$
-					org.eclipse.egit.core.internal.bitbucket.PullRequestComment comment = parseCommentActivity(
-							activityJson);
-					if (comment != null) {
-						result.add(comment);
-					}
-				}
-
-				pos = objEnd + 1;
-				while (pos < json.length() && (Character.isWhitespace(
-						json.charAt(pos)) || json.charAt(pos) == ',')) {
-					pos++;
-				}
-			} else {
-				pos++;
-			}
-		}
-
-		return result;
-	}
-
-	/**
-	 * Parses a single comment activity
-	 *
-	 * @param activityJson
-	 *            the activity JSON object
-	 * @return PullRequestComment or null
-	 */
-	private org.eclipse.egit.core.internal.bitbucket.PullRequestComment parseCommentActivity(
-			String activityJson) {
-		// Extract the "comment" object
-		String commentJson = extractObjectValue(activityJson, "\"comment\":"); //$NON-NLS-1$
-		if (commentJson == null) {
-			return null;
-		}
-
-		org.eclipse.egit.core.internal.bitbucket.PullRequestComment comment = parseComment(
-				commentJson);
-		if (comment == null) {
-			return null;
-		}
-
-		// Extract the "commentAnchor" object if present
-		String anchorJson = extractObjectValue(activityJson,
-				"\"commentAnchor\":"); //$NON-NLS-1$
-		if (anchorJson != null) {
-			parseCommentAnchor(comment, anchorJson);
-		}
-
-		return comment;
-	}
-
-	/**
-	 * Parses a comment object
-	 *
-	 * @param commentJson
-	 *            the comment JSON object
-	 * @return PullRequestComment or null
-	 */
-	private org.eclipse.egit.core.internal.bitbucket.PullRequestComment parseComment(
-			String commentJson) {
-		org.eclipse.egit.core.internal.bitbucket.PullRequestComment comment = new org.eclipse.egit.core.internal.bitbucket.PullRequestComment();
-
-		// Parse id
-		Long id = extractLongValue(commentJson, "\"id\":"); //$NON-NLS-1$
-		if (id != null) {
-			comment.setId(id.longValue());
-		}
-
-		// Parse version
-		Integer version = extractIntValue(commentJson, "\"version\":"); //$NON-NLS-1$
-		if (version != null) {
-			comment.setVersion(version.intValue());
-		}
-
-		// Parse text
-		String text = extractStringValue(commentJson, "\"text\":"); //$NON-NLS-1$
-		if (text != null) {
-			comment.setText(text);
-		}
-
-		// Parse author
-		String authorJson = extractObjectValue(commentJson, "\"author\":"); //$NON-NLS-1$
-		if (authorJson != null) {
-			String name = extractStringValue(authorJson, "\"name\":"); //$NON-NLS-1$
-			String displayName = extractStringValue(authorJson,
-					"\"displayName\":"); //$NON-NLS-1$
-			String email = extractStringValue(authorJson, "\"emailAddress\":"); //$NON-NLS-1$
-			comment.setAuthorName(name);
-			comment.setAuthorDisplayName(displayName);
-			comment.setAuthorEmail(email);
-		}
-
-		// Parse createdDate
-		Long createdDate = extractLongValue(commentJson, "\"createdDate\":"); //$NON-NLS-1$
-		if (createdDate != null) {
-			comment.setCreatedDate(new java.util.Date(createdDate.longValue()));
-		}
-
-		// Parse updatedDate
-		Long updatedDate = extractLongValue(commentJson, "\"updatedDate\":"); //$NON-NLS-1$
-		if (updatedDate != null) {
-			comment.setUpdatedDate(new java.util.Date(updatedDate.longValue()));
-		}
-
-		// Parse state
-		String state = extractStringValue(commentJson, "\"state\":"); //$NON-NLS-1$
-		if (state != null) {
-			comment.setState(state);
-		}
-
-		// Parse severity
-		String severity = extractStringValue(commentJson, "\"severity\":"); //$NON-NLS-1$
-		if (severity != null) {
-			comment.setSeverity(severity);
-		}
-
-		// Parse replies (nested comments)
-		String repliesJson = extractObjectValue(commentJson, "\"comments\":"); //$NON-NLS-1$
-		if (repliesJson != null && repliesJson.startsWith("[")) { //$NON-NLS-1$
-			List<org.eclipse.egit.core.internal.bitbucket.PullRequestComment> replies = parseCommentArray(
-					repliesJson);
-			comment.setReplies(replies);
-		}
-
-		return comment;
-	}
-
-	/**
-	 * Parses a comment anchor into the comment object
-	 *
-	 * @param comment
-	 *            the comment to update
-	 * @param anchorJson
-	 *            the anchor JSON object
-	 */
-	private void parseCommentAnchor(
-			org.eclipse.egit.core.internal.bitbucket.PullRequestComment comment,
-			String anchorJson) {
-		// Parse line
-		Integer line = extractIntValue(anchorJson, "\"line\":"); //$NON-NLS-1$
-		comment.setLine(line);
-
-		// Parse lineType
-		String lineType = extractStringValue(anchorJson, "\"lineType\":"); //$NON-NLS-1$
-		comment.setLineType(lineType);
-
-		// Parse fileType
-		String fileType = extractStringValue(anchorJson, "\"fileType\":"); //$NON-NLS-1$
-		comment.setFileType(fileType);
-
-		// Parse path
-		String path = extractStringValue(anchorJson, "\"path\":"); //$NON-NLS-1$
-		comment.setPath(path);
-
-		// Parse srcPath
-		String srcPath = extractStringValue(anchorJson, "\"srcPath\":"); //$NON-NLS-1$
-		comment.setSrcPath(srcPath);
-	}
-
-	/**
-	 * Parses an array of comments
-	 *
-	 * @param arrayJson
-	 *            the JSON array string
-	 * @return list of comments
-	 */
-	private List<org.eclipse.egit.core.internal.bitbucket.PullRequestComment> parseCommentArray(
-			String arrayJson) {
-		List<org.eclipse.egit.core.internal.bitbucket.PullRequestComment> result = new ArrayList<>();
-
-		if (!arrayJson.startsWith("[")) { //$NON-NLS-1$
-			return result;
-		}
-
-		int pos = 1; // Skip opening bracket
-		while (pos < arrayJson.length()) {
-			while (pos < arrayJson.length()
-					&& Character.isWhitespace(arrayJson.charAt(pos))) {
-				pos++;
-			}
-
-			if (pos >= arrayJson.length() || arrayJson.charAt(pos) == ']') {
-				break;
-			}
-
-			if (arrayJson.charAt(pos) == '{') {
-				int objEnd = findMatchingBrace(arrayJson, pos);
-				if (objEnd == -1) {
-					break;
-				}
-
-				String commentJson = arrayJson.substring(pos, objEnd + 1);
-				org.eclipse.egit.core.internal.bitbucket.PullRequestComment comment = parseComment(
-						commentJson);
-				if (comment != null) {
-					result.add(comment);
-				}
-
-				pos = objEnd + 1;
-				while (pos < arrayJson.length() && (Character.isWhitespace(
-						arrayJson.charAt(pos)) || arrayJson.charAt(pos) == ',')) {
-					pos++;
-				}
-			} else {
-				pos++;
-			}
-		}
-
-		return result;
-	}
-
-	/**
 	 * Highlights lines in the compare viewer that have comments.
 	 * Traverses the widget tree to find StyledText widgets and applies
 	 * LineBackgroundListener to highlight commented lines.
@@ -2260,7 +1485,7 @@ public class PullRequestsView extends ViewPart {
 		// Traverse widget tree to find StyledText widgets
 		if (control instanceof org.eclipse.swt.custom.StyledText) {
 			org.eclipse.swt.custom.StyledText styledText = (org.eclipse.swt.custom.StyledText) control;
-			
+
 			// Determine if this is left or right side based on widget data or parent
 			// For now, we'll check if any comments match this side
 			// Create a line background listener for this StyledText
@@ -2279,11 +1504,10 @@ public class PullRequestsView extends ViewPart {
 						return comment.getLine().intValue() == displayLine;
 					});
 
-					if (hasComment) {
-						// Light yellow background for commented lines
-						event.lineBackground = styledText.getDisplay()
-								.getSystemColor(org.eclipse.swt.SWT.COLOR_YELLOW);
-					}
+				if (hasComment) {
+					// Use editor selection background color for commented lines
+					event.lineBackground = commentedLineHighlightColor;
+				}
 				}
 			};
 
@@ -2316,8 +1540,6 @@ public class PullRequestsView extends ViewPart {
 
 		int targetLine = comment.getLine().intValue();
 		String fileType = comment.getFileType(); // "FROM" (left) or "TO" (right)
-
-		System.out.println("Scrolling to line " + targetLine + " on side: " + fileType); //$NON-NLS-1$ //$NON-NLS-2$
 
 		// Find the appropriate StyledText widget (left or right side)
 		Control viewerControl = compareViewer.getControl();
@@ -2358,7 +1580,6 @@ public class PullRequestsView extends ViewPart {
 
 				// Ensure the line is visible
 				styledText.setTopIndex(Math.max(0, lineIndex - 5)); // Show some context
-				System.out.println("Scrolled to line " + targetLine + " in StyledText widget"); //$NON-NLS-1$ //$NON-NLS-2$
 			}
 		} else if (control instanceof Composite) {
 			// Recursively search children
@@ -2417,7 +1638,7 @@ public class PullRequestsView extends ViewPart {
 		}
 
 		String folderPath = folder.getPath().toString();
-		
+
 		return (int) allComments.stream()
 				.filter(comment -> {
 					if (comment.getPath() == null) {
@@ -2484,10 +1705,10 @@ public class PullRequestsView extends ViewPart {
 							openInWorkspace(selectedFiles);
 						}
 					};
-					// Enable only if at least one file exists in workspace
-					boolean anyInWorkspace = selectedFiles.stream()
-							.anyMatch(f -> f.getWorkspaceFile() != null);
-					openInWorkspaceAction.setEnabled(anyInWorkspace);
+					// Enable only if at least one file is not deleted
+					boolean anyOpenable = selectedFiles.stream()
+							.anyMatch(f -> f.getChangeType() != PullRequestChangedFile.ChangeType.DELETED);
+					openInWorkspaceAction.setEnabled(anyOpenable);
 					menuMgr.add(openInWorkspaceAction);
 				}
 
@@ -2607,22 +1828,45 @@ public class PullRequestsView extends ViewPart {
 	}
 
 	/**
-	 * Opens the selected files in the workspace editor.
+	 * Opens the selected changed files in the working tree editor.
+	 * <p>
+	 * This method follows the pattern from StagingView: it constructs the
+	 * absolute filesystem path from the repository working tree and opens the
+	 * file via {@link DiffViewer#openFileInEditor(java.io.File, int)}, which
+	 * handles workspace file resolution and EFS fallback automatically.
+	 * </p>
 	 *
 	 * @param files
 	 *            the files to open
 	 */
 	private void openInWorkspace(List<PullRequestChangedFile> files) {
 		for (PullRequestChangedFile file : files) {
-			IFile workspaceFile = file.getWorkspaceFile();
-			if (workspaceFile != null && workspaceFile.exists()) {
-				try {
-					IDE.openEditor(getSite().getPage(), workspaceFile);
-				} catch (PartInitException e) {
-					Activator.logError("Failed to open file in editor: " //$NON-NLS-1$
-							+ workspaceFile.getFullPath(), e);
-				}
+			// Skip deleted files
+			if (file.getChangeType() == PullRequestChangedFile.ChangeType.DELETED) {
+				continue;
 			}
+
+			// Get repository from file (may be null if not set)
+			Repository repo = file.getRepository();
+			if (repo == null) {
+				// Fallback: try to get workspace file and derive path from it
+				IFile workspaceFile = file.getWorkspaceFile();
+				if (workspaceFile != null) {
+					IPath location = workspaceFile.getLocation();
+					if (location != null) {
+						DiffViewer.openFileInEditor(location.toFile(), -1);
+					}
+				}
+				continue;
+			}
+
+			// Construct filesystem path from repository working tree
+			java.io.File fsFile = new Path(
+					repo.getWorkTree().getAbsolutePath())
+					.append(file.getPath()).toFile();
+
+			// Open file in editor (handles workspace file resolution and error reporting)
+			DiffViewer.openFileInEditor(fsFile, -1);
 		}
 	}
 }

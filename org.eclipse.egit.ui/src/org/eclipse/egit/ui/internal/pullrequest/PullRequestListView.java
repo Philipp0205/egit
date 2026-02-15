@@ -13,20 +13,31 @@ package org.eclipse.egit.ui.internal.pullrequest;
 import java.io.IOException;
 import java.text.MessageFormat;
 import java.util.ArrayList;
+import java.util.Collection;
 import java.util.List;
 
 import org.eclipse.core.runtime.IProgressMonitor;
 import org.eclipse.core.runtime.IStatus;
 import org.eclipse.core.runtime.Status;
 import org.eclipse.core.runtime.jobs.Job;
-import org.eclipse.egit.core.internal.bitbucket.BitbucketClient;
 import org.eclipse.egit.core.internal.bitbucket.PullRequest;
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
+import org.eclipse.egit.core.internal.pullrequest.PullRequestClientFactory;
 import org.eclipse.egit.ui.Activator;
 import org.eclipse.egit.ui.UIPreferences;
 import org.eclipse.egit.ui.internal.PreferenceBasedDateFormatter;
+import org.eclipse.egit.ui.internal.TreeColumnPatternFilter;
 import org.eclipse.egit.ui.internal.UIIcons;
+import org.eclipse.egit.ui.internal.components.DropDownMenuAction;
 import org.eclipse.jface.action.Action;
+import org.eclipse.jface.action.ActionContributionItem;
+import org.eclipse.jface.action.IAction;
+import org.eclipse.jface.action.IContributionItem;
+import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.IToolBarManager;
+import org.eclipse.jface.dialogs.InputDialog;
+import org.eclipse.jface.dialogs.MessageDialog;
+import org.eclipse.jface.window.Window;
 import org.eclipse.jface.layout.GridDataFactory;
 import org.eclipse.jface.layout.GridLayoutFactory;
 import org.eclipse.jface.layout.TreeColumnLayout;
@@ -39,16 +50,11 @@ import org.eclipse.jface.viewers.ITreeContentProvider;
 import org.eclipse.jface.viewers.TreeViewer;
 import org.eclipse.jface.viewers.TreeViewerColumn;
 import org.eclipse.swt.SWT;
-import org.eclipse.swt.events.KeyAdapter;
-import org.eclipse.swt.events.KeyEvent;
-import org.eclipse.swt.events.SelectionAdapter;
-import org.eclipse.swt.events.SelectionEvent;
 import org.eclipse.swt.graphics.Image;
-import org.eclipse.swt.widgets.Combo;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
-import org.eclipse.swt.widgets.Label;
-import org.eclipse.swt.widgets.Text;
+import org.eclipse.ui.IActionBars;
+import org.eclipse.ui.dialogs.FilteredTree;
 import org.eclipse.ui.forms.widgets.Form;
 import org.eclipse.ui.forms.widgets.FormToolkit;
 import org.eclipse.ui.part.ViewPart;
@@ -77,12 +83,16 @@ public class PullRequestListView extends ViewPart {
 
 	private Action refreshAction;
 
-	// Filter controls
-	private Text authorFilterText;
+	private Action authorFilterAction;
 
-	private Text titleFilterText;
+	private DropDownMenuAction stateFilterAction;
 
-	private Combo stateCombo;
+	// Server-side filter settings
+	private String currentAuthorFilter = null;
+
+	private String currentStateFilter = null;
+
+	private boolean configWarningShown = false;
 
 	@Override
 	public void createPartControl(Composite parent) {
@@ -98,24 +108,30 @@ public class PullRequestListView extends ViewPart {
 		toolkit.decorateFormHeading(form);
 		GridLayoutFactory.fillDefaults().applyTo(form.getBody());
 
-		// Create composite for filters below headers and tree
-		Composite tableComposite = new Composite(form.getBody(), SWT.NONE);
+		// Create composite for tree
+		Composite tableComposite = toolkit.createComposite(form.getBody());
 		GridDataFactory.fillDefaults().grab(true, true).applyTo(tableComposite);
 		GridLayoutFactory.fillDefaults().applyTo(tableComposite);
 
-		// Create filter row
-		createFilterRow(tableComposite);
+		final TreeColumnLayout treeColumnLayout = new TreeColumnLayout();
 
-		TreeColumnLayout treeColumnLayout = new TreeColumnLayout();
-		Composite layoutComposite = new Composite(tableComposite, SWT.NONE);
-		layoutComposite.setLayout(treeColumnLayout);
-		GridDataFactory.fillDefaults().grab(true, true)
-				.applyTo(layoutComposite);
+		FilteredTree filteredTree = new FilteredTree(tableComposite,
+				SWT.BORDER | SWT.FULL_SELECTION | SWT.MULTI,
+				new TreeColumnPatternFilter(), true, true) {
 
-		pullRequestViewer = new TreeViewer(layoutComposite,
-				SWT.BORDER | SWT.FULL_SELECTION | SWT.MULTI);
+			@Override
+			protected void createControl(Composite composite, int treeStyle) {
+				super.createControl(composite, treeStyle);
+				treeComposite.setLayout(treeColumnLayout);
+			}
+		};
+
+		toolkit.adapt(filteredTree);
+		pullRequestViewer = filteredTree.getViewer();
 		pullRequestViewer.getTree().setHeaderVisible(true);
 		pullRequestViewer.getTree().setLinesVisible(true);
+		pullRequestViewer.getTree().setData(FormToolkit.KEY_DRAW_BORDER,
+				FormToolkit.TREE_BORDER);
 
 		setupColumns(treeColumnLayout);
 
@@ -150,7 +166,18 @@ public class PullRequestListView extends ViewPart {
 		getSite().setSelectionProvider(pullRequestViewer);
 
 		createActions();
+		createFilterActions();
 		contributeToActionBars();
+
+		// Initialize default filters
+		currentStateFilter = null; // Default to OPEN (handled in createStateFilterItem)
+
+		// Try to set author from preferences
+		String username = Activator.getDefault().getPreferenceStore()
+				.getString(UIPreferences.BITBUCKET_USERNAME);
+		if (username != null && !username.isEmpty()) {
+			currentAuthorFilter = username;
+		}
 
 		// Automatically refresh pull requests when view opens
 		refreshPullRequests();
@@ -268,106 +295,6 @@ public class PullRequestListView extends ViewPart {
 		return column;
 	}
 
-	/**
-	 * Creates a filter row with text fields aligned to table columns
-	 */
-	private void createFilterRow(Composite parent) {
-		Composite filterRow = toolkit.createComposite(parent);
-		GridDataFactory.fillDefaults().grab(true, false).applyTo(filterRow);
-		GridLayoutFactory.fillDefaults().numColumns(6).equalWidth(false)
-				.applyTo(filterRow);
-
-		// ID column - no filter (10% width)
-		Label idSpacer = new Label(filterRow, SWT.NONE);
-		GridDataFactory.fillDefaults().hint(50, SWT.DEFAULT).applyTo(idSpacer);
-
-		// Title column filter (40% width)
-		titleFilterText = new Text(filterRow, SWT.BORDER | SWT.SEARCH | SWT.ICON_CANCEL);
-		titleFilterText.setMessage("Filter title..."); //$NON-NLS-1$
-		GridDataFactory.fillDefaults().grab(true, false).hint(200, SWT.DEFAULT)
-				.applyTo(titleFilterText);
-		titleFilterText.addKeyListener(new KeyAdapter() {
-			@Override
-			public void keyPressed(KeyEvent e) {
-				if (e.keyCode == SWT.CR || e.keyCode == SWT.KEYPAD_CR) {
-					refreshPullRequests();
-				}
-			}
-		});
-		titleFilterText.addModifyListener(e -> {
-			// Live filtering for title (client-side)
-			filterAndRefreshViewer();
-		});
-
-		// Author column filter (20% width)
-		authorFilterText = new Text(filterRow, SWT.BORDER | SWT.SEARCH | SWT.ICON_CANCEL);
-		authorFilterText.setMessage("Filter author..."); //$NON-NLS-1$
-		GridDataFactory.fillDefaults().hint(100, SWT.DEFAULT)
-				.applyTo(authorFilterText);
-		
-		// Default to configured username
-		String username = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_USERNAME);
-		if (username != null && !username.isEmpty()) {
-			authorFilterText.setText(username);
-		}
-		
-		authorFilterText.addKeyListener(new KeyAdapter() {
-			@Override
-			public void keyPressed(KeyEvent e) {
-				if (e.keyCode == SWT.CR || e.keyCode == SWT.KEYPAD_CR) {
-					refreshPullRequests();
-				}
-			}
-		});
-
-		// State column filter (10% width)
-		stateCombo = new Combo(filterRow, SWT.READ_ONLY | SWT.BORDER);
-		stateCombo.setItems(new String[] { "OPEN", "MERGED", "DECLINED", "ALL" }); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
-		stateCombo.select(0); // Default to OPEN
-		GridDataFactory.fillDefaults().hint(80, SWT.DEFAULT)
-				.applyTo(stateCombo);
-		stateCombo.addSelectionListener(new SelectionAdapter() {
-			@Override
-			public void widgetSelected(SelectionEvent e) {
-				refreshPullRequests();
-			}
-		});
-
-		// Comments column - no filter (10% width)
-		Label commentsSpacer = new Label(filterRow, SWT.NONE);
-		GridDataFactory.fillDefaults().hint(60, SWT.DEFAULT)
-				.applyTo(commentsSpacer);
-
-		// Updated column - no filter (20% width)
-		Label updatedSpacer = new Label(filterRow, SWT.NONE);
-		GridDataFactory.fillDefaults().hint(100, SWT.DEFAULT)
-				.applyTo(updatedSpacer);
-	}
-
-	/**
-	 * Filters the viewer content based on title filter (client-side filtering)
-	 */
-	private void filterAndRefreshViewer() {
-		String titleFilter = titleFilterText.getText().trim().toLowerCase();
-		
-		List<PullRequest> filtered = new ArrayList<>();
-		for (PullRequest pr : pullRequests) {
-			if (titleFilter.isEmpty()
-					|| pr.getTitle().toLowerCase().contains(titleFilter)) {
-				filtered.add(pr);
-			}
-		}
-		
-		Display.getDefault().asyncExec(() -> {
-			if (!pullRequestViewer.getControl().isDisposed()) {
-				pullRequestViewer.setInput(filtered);
-				pullRequestViewer.refresh();
-				updateFormTitle(filtered.size());
-			}
-		});
-	}
-
 	private void createActions() {
 		refreshAction = new Action("Refresh") { //$NON-NLS-1$
 			@Override
@@ -379,103 +306,122 @@ public class PullRequestListView extends ViewPart {
 		refreshAction.setToolTipText("Refresh pull requests"); //$NON-NLS-1$
 	}
 
+	private void createFilterActions() {
+		// Author filter action
+		authorFilterAction = new Action("Filter by Author...", IAction.AS_PUSH_BUTTON) { //$NON-NLS-1$
+			@Override
+			public void run() {
+				InputDialog dialog = new InputDialog(
+					getSite().getShell(),
+					"Filter by Author", //$NON-NLS-1$
+					"Enter author username (leave empty for all authors):", //$NON-NLS-1$
+					currentAuthorFilter != null ? currentAuthorFilter : "", //$NON-NLS-1$
+					null);
+
+				if (dialog.open() == Window.OK) {
+					String newAuthor = dialog.getValue().trim();
+					currentAuthorFilter = newAuthor.isEmpty() ? null : newAuthor;
+					refreshPullRequests();
+				}
+			}
+		};
+		authorFilterAction.setToolTipText("Filter pull requests by author"); //$NON-NLS-1$
+
+		// State filter dropdown action
+		stateFilterAction = new DropDownMenuAction("State Filter") { //$NON-NLS-1$
+			@Override
+			protected Collection<IContributionItem> getActions() {
+				List<IContributionItem> items = new ArrayList<>();
+				items.add(createStateFilterItem("OPEN")); //$NON-NLS-1$
+				items.add(createStateFilterItem("MERGED")); //$NON-NLS-1$
+				items.add(createStateFilterItem("DECLINED")); //$NON-NLS-1$
+				items.add(createStateFilterItem("ALL")); //$NON-NLS-1$
+				return items;
+			}
+		};
+		stateFilterAction.setToolTipText("Filter pull requests by state"); //$NON-NLS-1$
+		stateFilterAction.setImageDescriptor(UIIcons.ELCL16_FILTER);
+	}
+
+	private ActionContributionItem createStateFilterItem(final String state) {
+		Action action = new Action(state, IAction.AS_RADIO_BUTTON) {
+			@Override
+			public void run() {
+				if (isChecked()) {
+					currentStateFilter = "ALL".equals(state) ? null : state; //$NON-NLS-1$
+					refreshPullRequests();
+				}
+			}
+		};
+		// Set OPEN as default checked
+		if ("OPEN".equals(state) && currentStateFilter == null) { //$NON-NLS-1$
+			action.setChecked(true);
+		} else if (state.equals(currentStateFilter)) {
+			action.setChecked(true);
+		}
+		return new ActionContributionItem(action);
+	}
+
 	private void contributeToActionBars() {
-		IToolBarManager toolBarManager = getViewSite().getActionBars()
-				.getToolBarManager();
+		IActionBars actionBars = getViewSite().getActionBars();
+		IToolBarManager toolBarManager = actionBars.getToolBarManager();
 		toolBarManager.add(refreshAction);
+
+		// Add filter actions to view menu (dropdown in top-right)
+		IMenuManager menuManager = actionBars.getMenuManager();
+		menuManager.add(authorFilterAction);
+		menuManager.add(stateFilterAction);
 	}
 
 	private void refreshPullRequests() {
-		// Get configuration from preferences
-		final String serverUrl = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_SERVER_URL);
-		final String token = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_ACCESS_TOKEN);
-		final String projectKey = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_PROJECT_KEY);
-		final String repoSlug = Activator.getDefault().getPreferenceStore()
-				.getString(UIPreferences.BITBUCKET_REPO_SLUG);
+		// Create client from factory
+		IPullRequestClient client = PullRequestClientFactory.createClient();
 
-		if (serverUrl.isEmpty() || token.isEmpty() || projectKey.isEmpty()
-				|| repoSlug.isEmpty()) {
+		if (client == null) {
 			form.setText("Pull Requests - Not configured"); //$NON-NLS-1$
+			pullRequests.clear();
+			pullRequestViewer.refresh();
+
+			// Show message once per view session
+			if (!configWarningShown) {
+				configWarningShown = true;
+				Display.getDefault().asyncExec(() -> {
+					if (!pullRequestViewer.getControl().isDisposed()) {
+						MessageDialog.openInformation(
+								pullRequestViewer.getControl().getShell(),
+								"Pull Request Configuration Required", //$NON-NLS-1$
+								"Pull request provider is not configured.\n\n" //$NON-NLS-1$
+								+ "Please configure your pull request provider in:\n" //$NON-NLS-1$
+								+ "Window > Preferences > Team > Pull Requests"); //$NON-NLS-1$
+					}
+				});
+			}
 			return;
 		}
 
-		// Get filter values from UI controls
-		final String authorFilter = authorFilterText.getText().trim();
-		final String titleFilter = titleFilterText.getText().trim();
-		final String selectedState = stateCombo.getText();
-		final String stateFilter = "ALL".equals(selectedState) ? null : selectedState; //$NON-NLS-1$
+		// Reset warning flag when successfully configured
+		configWarningShown = false;
 
 		Job job = new Job("Fetching pull requests") { //$NON-NLS-1$
 			@Override
 			protected IStatus run(IProgressMonitor monitor) {
-				monitor.beginTask("Fetching pull requests from Bitbucket", //$NON-NLS-1$
+				monitor.beginTask("Fetching pull requests", //$NON-NLS-1$
 						IProgressMonitor.UNKNOWN);
 
 				try {
-					BitbucketClient client = new BitbucketClient(serverUrl,
-							token);
+					// Fetch PRs with server-side filters only
+					List<PullRequest> fetchedPRs = client.getPullRequests(
+							currentStateFilter, currentAuthorFilter, null, 100, 0);
 
-					// Apply author filter to server request (empty string means all authors)
-					String serverAuthorFilter = authorFilter.isEmpty() ? null : authorFilter;
-
-					// Fetch PRs with server-side filters
-					String jsonResponse = client.getPullRequests(projectKey,
-							repoSlug, stateFilter, serverAuthorFilter, null, 100, 0);
-
-					// Parse JSON response
-					List<PullRequest> fetchedPRs = PullRequestJsonParser
-							.parsePullRequests(jsonResponse);
-
-					// Apply client-side title filter if specified
-					List<PullRequest> filteredPRs = fetchedPRs;
-					if (!titleFilter.isEmpty()) {
-						filteredPRs = new ArrayList<>();
-						String lowerTitleFilter = titleFilter.toLowerCase();
-						for (PullRequest pr : fetchedPRs) {
-							if (pr.getTitle() != null && pr.getTitle().toLowerCase()
-									.contains(lowerTitleFilter)) {
-								filteredPRs.add(pr);
-							}
-						}
-					}
-
-					// Build filter info for display
-					final List<String> filterParts = new ArrayList<>();
-					if (!authorFilter.isEmpty()) {
-						filterParts.add("Author: " + authorFilter); //$NON-NLS-1$
-					}
-					if (!titleFilter.isEmpty()) {
-						filterParts.add("Title: " + titleFilter); //$NON-NLS-1$
-					}
-					filterParts.add("State: " + selectedState); //$NON-NLS-1$
-					final String filterInfo = String.join(", ", filterParts); //$NON-NLS-1$
-
-					final List<PullRequest> finalPRs = filteredPRs;
 					Display.getDefault().asyncExec(() -> {
 						if (!pullRequestViewer.getControl().isDisposed()) {
 							pullRequests.clear();
-							pullRequests.addAll(finalPRs);
+							pullRequests.addAll(fetchedPRs);
 							pullRequestViewer.setInput(pullRequests);
 							pullRequestViewer.refresh();
-							
-							// Build filter info for display
-							List<String> displayFilters = new ArrayList<>();
-							if (!authorFilter.isEmpty()) {
-								displayFilters.add("Author: " + authorFilter); //$NON-NLS-1$
-							}
-							if (!titleFilter.isEmpty()) {
-								displayFilters.add("Title: " + titleFilter); //$NON-NLS-1$
-							}
-							displayFilters.add("State: " + selectedState); //$NON-NLS-1$
-							
-							String filterDisplay = String.join(", ", displayFilters); //$NON-NLS-1$
-							form.setText(MessageFormat.format(
-									"Pull Requests ({0}) - {1}", //$NON-NLS-1$
-									Integer.valueOf(pullRequests.size()),
-									filterDisplay));
+
+							// Update form title with filter info
+							updateFormTitle();
 						}
 					});
 
@@ -493,14 +439,21 @@ public class PullRequestListView extends ViewPart {
 	}
 
 	/**
-	 * Updates the form title with the current PR count
-	 *
-	 * @param count
-	 *            the number of PRs currently displayed
+	 * Updates the form title with the current PR count and active filters
 	 */
-	private void updateFormTitle(int count) {
-		form.setText(MessageFormat.format("Pull Requests ({0})", //$NON-NLS-1$
-				Integer.valueOf(count)));
+	private void updateFormTitle() {
+		List<String> filters = new ArrayList<>();
+
+		if (currentAuthorFilter != null && !currentAuthorFilter.isEmpty()) {
+			filters.add("Author: " + currentAuthorFilter); //$NON-NLS-1$
+		}
+
+		String state = currentStateFilter != null ? currentStateFilter : "OPEN"; //$NON-NLS-1$
+		filters.add("State: " + state); //$NON-NLS-1$
+
+		String filterDisplay = filters.isEmpty() ? "" : " - " + String.join(", ", filters); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+		form.setText(MessageFormat.format("Pull Requests ({0}){1}", //$NON-NLS-1$
+				Integer.valueOf(pullRequests.size()), filterDisplay));
 	}
 
 	@Override
@@ -510,6 +463,9 @@ public class PullRequestListView extends ViewPart {
 
 	@Override
 	public void dispose() {
+		if (stateFilterAction != null) {
+			stateFilterAction.dispose();
+		}
 		if (imageCache != null) {
 			imageCache.dispose();
 		}

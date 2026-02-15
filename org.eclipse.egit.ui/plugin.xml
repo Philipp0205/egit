@@ -662,11 +662,11 @@
       </page>
       <page
             category="org.eclipse.egit.ui.GitPreferences"
-            class="org.eclipse.egit.ui.internal.preferences.BitbucketPreferencePage"
-            id="org.eclipse.egit.ui.internal.preferences.BitbucketPreferencePage"
-            name="%BitbucketPreferencePage.name">
+            class="org.eclipse.egit.ui.internal.preferences.PullRequestPreferencePage"
+            id="org.eclipse.egit.ui.internal.preferences.PullRequestPreferencePage"
+            name="%PullRequestPreferencePage.name">
          <keywordReference
-               id="org.eclipse.egit.ui.internal.preferences.BitbucketPreferencePage">
+               id="org.eclipse.egit.ui.internal.preferences.PullRequestPreferencePage">
          </keywordReference>
       </page>
       <page
@@ -741,6 +741,10 @@
       <keyword
             id="org.eclipse.egit.ui.internal.preferences.DateFormatPreferencePage"
             label="%DateFormatPreferencePage_keywords">
+      </keyword>
+      <keyword
+            id="org.eclipse.egit.ui.internal.preferences.PullRequestPreferencePage"
+            label="%PullRequestPreferencePage_keywords">
       </keyword>
       <keyword
             id="org.eclipse.egit.ui.internal.preferences.GitDecoratorPreferencePage"

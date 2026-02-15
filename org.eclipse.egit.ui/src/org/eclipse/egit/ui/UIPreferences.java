@@ -385,6 +385,10 @@ public final class UIPreferences {
 		return s.toString();
 	}
 
+	// Pull Request provider preferences
+	/** Pull request provider type (BITBUCKET or GITHUB) */
+	public static final String PULLREQUEST_PROVIDER_TYPE = "pullrequest_provider_type"; //$NON-NLS-1$
+
 	// Bitbucket Data Center preferences
 	/** Bitbucket server URL */
 	public static final String BITBUCKET_SERVER_URL = "bitbucket_server_url"; //$NON-NLS-1$
@@ -400,6 +404,16 @@ public final class UIPreferences {
 
 	/** Bitbucket username (for filtering pull requests) */
 	public static final String BITBUCKET_USERNAME = "bitbucket_username"; //$NON-NLS-1$
+
+	// GitHub preferences
+	/** GitHub repository owner (user or organization) */
+	public static final String GITHUB_OWNER = "github_owner"; //$NON-NLS-1$
+
+	/** GitHub repository name */
+	public static final String GITHUB_REPO = "github_repo"; //$NON-NLS-1$
+
+	/** GitHub personal access token */
+	public static final String GITHUB_ACCESS_TOKEN = "github_access_token"; //$NON-NLS-1$
 
 	/** Pull Request changes view sash weights */
 	public static final String PULLREQUEST_CHANGES_SASH_WEIGHTS = "pullrequest_changes_sash_weights"; //$NON-NLS-1$

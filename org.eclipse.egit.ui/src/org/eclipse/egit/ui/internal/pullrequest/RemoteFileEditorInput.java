@@ -18,7 +18,7 @@ import org.eclipse.ui.IPersistableElement;
 import org.eclipse.ui.IStorageEditorInput;
 
 /**
- * Editor input for Bitbucket file revisions.
+ * Editor input for remote file revisions from pull request providers.
  * <p>
  * This class provides the bridge between the compare framework's
  * {@link org.eclipse.compare.ISharedDocumentAdapter} and Eclipse's editor
@@ -27,10 +27,10 @@ import org.eclipse.ui.IStorageEditorInput;
  * Java Source Compare.
  * </p>
  */
-public class BitbucketFileEditorInput extends PlatformObject
+public class RemoteFileEditorInput extends PlatformObject
 		implements IStorageEditorInput {
 
-	private final BitbucketFileTypedElement element;
+	private final RemoteFileTypedElement element;
 
 	private final IStorage storage;
 
@@ -42,7 +42,7 @@ public class BitbucketFileEditorInput extends PlatformObject
 	 * @param storage
 	 *            the storage containing the file contents
 	 */
-	public BitbucketFileEditorInput(BitbucketFileTypedElement element,
+	public RemoteFileEditorInput(RemoteFileTypedElement element,
 			IStorage storage) {
 		this.element = element;
 		this.storage = storage;
@@ -97,8 +97,8 @@ public class BitbucketFileEditorInput extends PlatformObject
 		if (this == obj) {
 			return true;
 		}
-		if (obj instanceof BitbucketFileEditorInput) {
-			BitbucketFileEditorInput other = (BitbucketFileEditorInput) obj;
+		if (obj instanceof RemoteFileEditorInput) {
+			RemoteFileEditorInput other = (RemoteFileEditorInput) obj;
 			return element.equals(other.element);
 		}
 		return false;

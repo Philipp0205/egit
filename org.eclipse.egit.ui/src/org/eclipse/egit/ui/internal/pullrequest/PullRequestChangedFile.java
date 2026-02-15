@@ -234,19 +234,24 @@ public class PullRequestChangedFile implements IProblemDecoratable {
 	 */
 	public static PullRequestChangedFile fromChangedFile(ChangedFile cf) {
 		ChangeType type;
-		switch (cf.getType()) {
-		case "ADD": //$NON-NLS-1$
-			type = ChangeType.ADDED;
-			break;
-		case "DELETE": //$NON-NLS-1$
-			type = ChangeType.DELETED;
-			break;
-		case "MOVE": //$NON-NLS-1$
-			type = ChangeType.RENAMED;
-			break;
-		default:
+		String changeType = cf.getType();
+		if (changeType == null) {
 			type = ChangeType.MODIFIED;
-			break;
+		} else {
+			switch (changeType) {
+			case "ADD": //$NON-NLS-1$
+				type = ChangeType.ADDED;
+				break;
+			case "DELETE": //$NON-NLS-1$
+				type = ChangeType.DELETED;
+				break;
+			case "MOVE": //$NON-NLS-1$
+				type = ChangeType.RENAMED;
+				break;
+			default:
+				type = ChangeType.MODIFIED;
+				break;
+			}
 		}
 
 		String srcPathStr = null;

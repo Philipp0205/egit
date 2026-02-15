@@ -8,21 +8,17 @@
  *
  * SPDX-License-Identifier: EPL-2.0
  *******************************************************************************/
-package org.eclipse.egit.ui.internal.pullrequest;
+package org.eclipse.egit.core.internal.bitbucket;
 
 import java.util.ArrayList;
 import java.util.List;
 
-import org.eclipse.egit.core.internal.bitbucket.ChangedFile;
-import org.eclipse.egit.core.internal.bitbucket.PullRequest;
-import org.eclipse.egit.core.internal.bitbucket.PullRequestComment;
-
 /**
  * Utility class for parsing JSON responses from Bitbucket Data Center REST API
  */
-public class PullRequestJsonParser {
+class BitbucketJsonParser {
 
-	private PullRequestJsonParser() {
+	private BitbucketJsonParser() {
 		// Utility class, no instances
 	}
 
@@ -828,5 +824,71 @@ public class PullRequestJsonParser {
 		}
 
 		return -1;
+	}
+
+	/**
+	 * Parses a single comment from JSON (returned from comment creation/update)
+	 *
+	 * @param json
+	 *            the JSON response
+	 * @return the parsed comment
+	 */
+	static PullRequestComment parseSingleComment(String json) {
+		PullRequestComment comment = new PullRequestComment();
+
+		// Parse ID
+		String idStr = extractStringValue(json, "\"id\":"); //$NON-NLS-1$
+		if (idStr != null) {
+			try {
+				comment.setId(Long.parseLong(idStr));
+			} catch (NumberFormatException e) {
+				// Ignore
+			}
+		}
+
+		// Parse version
+		String versionStr = extractStringValue(json, "\"version\":"); //$NON-NLS-1$
+		if (versionStr != null) {
+			try {
+				comment.setVersion(Integer.parseInt(versionStr));
+			} catch (NumberFormatException e) {
+				// Ignore
+			}
+		}
+
+		// Parse text
+		String text = extractStringValue(json, "\"text\":"); //$NON-NLS-1$
+		if (text != null) {
+			comment.setText(text);
+		}
+
+		// Parse state
+		String state = extractStringValue(json, "\"state\":"); //$NON-NLS-1$
+		if (state != null) {
+			comment.setState(state);
+		}
+
+		// Parse severity
+		String severity = extractStringValue(json, "\"severity\":"); //$NON-NLS-1$
+		if (severity != null) {
+			comment.setSeverity(severity);
+		}
+
+		return comment;
+	}
+
+	/**
+	 * Extracts a simple string value from a JSON string, supporting both JSON
+	 * object fields {"field": "value"} and nested fields
+	 *
+	 * @param json
+	 *            the JSON string
+	 * @param key
+	 *            the key to extract (e.g., "name")
+	 * @return the extracted string value, or empty string if not found
+	 */
+	static String extractJsonString(String json, String key) {
+		String value = extractStringValue(json, "\"" + key + "\":"); //$NON-NLS-1$ //$NON-NLS-2$
+		return value != null ? value : ""; //$NON-NLS-1$
 	}
 }

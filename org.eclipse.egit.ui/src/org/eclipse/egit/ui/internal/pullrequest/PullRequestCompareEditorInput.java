@@ -21,9 +21,9 @@ import org.eclipse.compare.ITypedElement;
 import org.eclipse.compare.structuremergeviewer.DiffNode;
 import org.eclipse.compare.structuremergeviewer.ICompareInput;
 import org.eclipse.core.runtime.IProgressMonitor;
-import org.eclipse.egit.core.internal.bitbucket.BitbucketClient;
 import org.eclipse.egit.core.internal.bitbucket.PullRequest;
 import org.eclipse.egit.core.internal.bitbucket.PullRequestComment;
+import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
 import org.eclipse.egit.ui.Activator;
 import org.eclipse.egit.ui.UIPreferences;
 import org.eclipse.egit.ui.internal.revision.GitCompareFileRevisionEditorInput;
@@ -31,11 +31,11 @@ import org.eclipse.jface.viewers.Viewer;
 import org.eclipse.swt.widgets.Composite;
 
 /**
- * Compare editor input for comparing files from a Bitbucket pull request
+ * Compare editor input for comparing files from a pull request
  */
-public class BitbucketCompareEditorInput extends CompareEditorInput {
+public class PullRequestCompareEditorInput extends CompareEditorInput {
 
-	private final BitbucketClient client;
+	private final IPullRequestClient client;
 
 	private final PullRequest pullRequest;
 
@@ -46,21 +46,22 @@ public class BitbucketCompareEditorInput extends CompareEditorInput {
 	private List<PullRequestComment> comments = new ArrayList<>();
 
 	/**
-	 * Creates a new BitbucketCompareEditorInput
+	 * Creates a new PullRequestCompareEditorInput
 	 *
 	 * @param client
-	 *            the Bitbucket client
+	 *            the pull request client
 	 * @param pullRequest
 	 *            the pull request
 	 * @param changedFile
 	 *            the changed file to compare
 	 */
-	public BitbucketCompareEditorInput(BitbucketClient client,
+	public PullRequestCompareEditorInput(IPullRequestClient client,
 			PullRequest pullRequest, PullRequestChangedFile changedFile) {
 		super(new CompareConfiguration());
 		this.client = client;
 		this.pullRequest = pullRequest;
 		this.changedFile = changedFile;
+		System.out.println("[PullRequestCompareEditorInput] Created compare editor input for file: " + changedFile.getPath()); //$NON-NLS-1$
 
 		// Configure the compare editor
 		CompareConfiguration config = getCompareConfiguration();
@@ -99,41 +100,66 @@ public class BitbucketCompareEditorInput extends CompareEditorInput {
 	@Override
 	protected Object prepareInput(IProgressMonitor monitor)
 			throws InvocationTargetException, InterruptedException {
-		return createCompareInput(client, pullRequest, changedFile, monitor);
+		System.out.println("[PullRequestCompareEditorInput] *** prepareInput CALLED ***"); //$NON-NLS-1$
+		System.out.println("[PullRequestCompareEditorInput] prepareInput - File: " + changedFile.getPath()); //$NON-NLS-1$
+		System.out.println("[PullRequestCompareEditorInput] prepareInput - Comments: " + comments.size()); //$NON-NLS-1$
+		Object result = createCompareInput(client, pullRequest, changedFile, monitor);
+		System.out.println("[PullRequestCompareEditorInput] prepareInput - Result: " + (result != null ? result.getClass().getSimpleName() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
+		return result;
 	}
 
 	@Override
 	public Viewer findContentViewer(Viewer oldViewer, ICompareInput input,
 			Composite parent) {
+		System.out.println("[PullRequestCompareEditorInput] *** findContentViewer CALLED ***"); //$NON-NLS-1$
+		System.out.println("[PullRequestCompareEditorInput] findContentViewer - oldViewer: " + (oldViewer != null ? oldViewer.getClass().getName() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
+		System.out.println("[PullRequestCompareEditorInput] findContentViewer - comments: " + comments.size()); //$NON-NLS-1$
+		
 		// Check if inline comments should be displayed
 		boolean useInlineComments = Activator.getDefault()
 				.getPreferenceStore()
 				.getBoolean(UIPreferences.PULLREQUEST_SHOW_INLINE_COMMENTS);
+		System.out.println("[PullRequestCompareEditorInput] findContentViewer - useInlineComments: " + useInlineComments); //$NON-NLS-1$
 
 		if (useInlineComments && comments != null && !comments.isEmpty()) {
+			System.out.println("[PullRequestCompareEditorInput] findContentViewer - Will use InlineCommentTextMergeViewer"); //$NON-NLS-1$
+			
 			// Check if we can reuse the existing viewer
 			if (oldViewer instanceof InlineCommentTextMergeViewer) {
+				System.out.println("[PullRequestCompareEditorInput] findContentViewer - Reusing existing viewer"); //$NON-NLS-1$
 				InlineCommentTextMergeViewer inlineViewer = (InlineCommentTextMergeViewer) oldViewer;
+				inlineViewer.setFilePath(changedFile.getPath());
 				inlineViewer.setComments(comments);
 				contentViewer = inlineViewer;
 				return contentViewer;
 			}
 
 			// Need to create a new InlineCommentTextMergeViewer
-			// Only do this if oldViewer is null or incompatible
-			if (oldViewer == null) {
+			// Create if oldViewer is null OR if it's a NullViewer (placeholder viewer)
+			boolean canCreateNew = oldViewer == null 
+					|| oldViewer.getClass().getName().contains("NullViewer"); //$NON-NLS-1$
+			
+			if (canCreateNew) {
+				System.out.println("[PullRequestCompareEditorInput] findContentViewer - Creating NEW InlineCommentTextMergeViewer"); //$NON-NLS-1$
 				InlineCommentTextMergeViewer inlineViewer = new InlineCommentTextMergeViewer(
 						parent, getCompareConfiguration());
+				inlineViewer.setFilePath(changedFile.getPath());
 				inlineViewer.setComments(comments);
 				contentViewer = inlineViewer;
+				System.out.println("[PullRequestCompareEditorInput] findContentViewer - Created and returning InlineCommentTextMergeViewer"); //$NON-NLS-1$
 				return contentViewer;
 			}
 			// If oldViewer exists but is not our type, fall through to default
 			// to avoid handler conflicts
+			System.out.println("[PullRequestCompareEditorInput] findContentViewer - oldViewer incompatible, using default"); //$NON-NLS-1$
+		} else {
+			System.out.println("[PullRequestCompareEditorInput] findContentViewer - NOT using inline (useInlineComments=" + useInlineComments + ", comments=" + comments.size() + ")"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
 		}
 
 		// Use default viewer
+		System.out.println("[PullRequestCompareEditorInput] findContentViewer - Using default viewer"); //$NON-NLS-1$
 		contentViewer = super.findContentViewer(oldViewer, input, parent);
+		System.out.println("[PullRequestCompareEditorInput] findContentViewer - Returning: " + (contentViewer != null ? contentViewer.getClass().getName() : "null")); //$NON-NLS-1$ //$NON-NLS-2$
 		return contentViewer;
 	}
 
@@ -144,6 +170,7 @@ public class BitbucketCompareEditorInput extends CompareEditorInput {
 	 *            the list of comments for this file
 	 */
 	public void setComments(List<PullRequestComment> comments) {
+		System.out.println("[PullRequestCompareEditorInput] setComments called with " + (comments != null ? comments.size() : 0) + " comments"); //$NON-NLS-1$ //$NON-NLS-2$
 		if (comments != null) {
 			this.comments = new ArrayList<>(comments);
 		} else {
@@ -168,17 +195,13 @@ public class BitbucketCompareEditorInput extends CompareEditorInput {
 	 * @throws InterruptedException
 	 *             if the operation is interrupted
 	 */
-	public static Object createCompareInput(BitbucketClient client,
+	public static Object createCompareInput(IPullRequestClient client,
 			PullRequest pullRequest, PullRequestChangedFile changedFile,
 			IProgressMonitor monitor)
 			throws InvocationTargetException, InterruptedException {
 		monitor.beginTask("Comparing files...", IProgressMonitor.UNKNOWN); //$NON-NLS-1$
 
 		try {
-			String projectKey = pullRequest.getToRef().getRepository()
-					.getProject().getKey();
-			String repoSlug = pullRequest.getToRef().getRepository().getSlug();
-
 			// Get commit IDs - use displayId (branch name) as commit reference
 			String fromCommitId = pullRequest.getFromRef().getDisplayId();
 			String toCommitId = pullRequest.getToRef().getDisplayId();
@@ -192,14 +215,12 @@ public class BitbucketCompareEditorInput extends CompareEditorInput {
 				left = new GitCompareFileRevisionEditorInput.EmptyTypedElement(
 						changedFile.getName());
 				// File exists in source branch (right side)
-				right = new BitbucketFileTypedElement(client, projectKey,
-						repoSlug, fromCommitId, changedFile.getPath());
+				right = new RemoteFileTypedElement(client, fromCommitId, changedFile.getPath());
 				break;
 
 			case DELETED:
 				// File exists in target branch (left side)
-				left = new BitbucketFileTypedElement(client, projectKey,
-						repoSlug, toCommitId, changedFile.getPath());
+				left = new RemoteFileTypedElement(client, toCommitId, changedFile.getPath());
 				// File doesn't exist in source branch (right side)
 				right = new GitCompareFileRevisionEditorInput.EmptyTypedElement(
 						changedFile.getName());
@@ -207,21 +228,17 @@ public class BitbucketCompareEditorInput extends CompareEditorInput {
 
 			case RENAMED:
 				// Old file in target branch (left side)
-				left = new BitbucketFileTypedElement(client, projectKey,
-						repoSlug, toCommitId, changedFile.getOldPath());
+				left = new RemoteFileTypedElement(client, toCommitId, changedFile.getOldPath());
 				// New file in source branch (right side)
-				right = new BitbucketFileTypedElement(client, projectKey,
-						repoSlug, fromCommitId, changedFile.getPath());
+				right = new RemoteFileTypedElement(client, fromCommitId, changedFile.getPath());
 				break;
 
 			case MODIFIED:
 			default:
 				// File in target branch (left side)
-				left = new BitbucketFileTypedElement(client, projectKey,
-						repoSlug, toCommitId, changedFile.getPath());
+				left = new RemoteFileTypedElement(client, toCommitId, changedFile.getPath());
 				// File in source branch (right side)
-				right = new BitbucketFileTypedElement(client, projectKey,
-						repoSlug, fromCommitId, changedFile.getPath());
+				right = new RemoteFileTypedElement(client, fromCommitId, changedFile.getPath());
 				break;
 			}
 

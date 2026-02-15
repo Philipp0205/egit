@@ -24,14 +24,14 @@ public class BitbucketClientTest {
 	@Test
 	public void testClientConstruction() {
 		BitbucketClient client = new BitbucketClient(
-				"https://bitbucket.example.com", "test-token"); //$NON-NLS-1$ //$NON-NLS-2$
+				"https://bitbucket.example.com", "TEST", "test-repo", "test-token"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
 		assertThat(client, notNullValue());
 	}
 
 	@Test
 	public void testClientConstructionWithTrailingSlash() {
 		BitbucketClient client = new BitbucketClient(
-				"https://bitbucket.example.com/", "test-token"); //$NON-NLS-1$ //$NON-NLS-2$
+				"https://bitbucket.example.com/", "TEST", "test-repo", "test-token"); //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$ //$NON-NLS-4$
 		assertThat(client, notNullValue());
 	}
 
