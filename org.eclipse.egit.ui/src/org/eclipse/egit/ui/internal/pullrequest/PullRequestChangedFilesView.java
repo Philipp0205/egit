@@ -170,23 +170,26 @@ public class PullRequestChangedFilesView extends ViewPart {
 		// Create context menu for changed files
 		createChangedFilesPopupMenu(changedFilesViewer);
 
+		// NOTE: Selection listener removed to prevent loading PRs on single click.
+		// PRs are now loaded explicitly via double-click or Enter key in
+		// PullRequestListView, which calls loadPullRequest() directly.
 		// Listen for PR selection from PullRequestListView
-		prSelectionListener = new ISelectionListener() {
-			@Override
-			public void selectionChanged(IWorkbenchPart part,
-					ISelection selection) {
-				if (selection instanceof IStructuredSelection) {
-					Object first = ((IStructuredSelection) selection)
-							.getFirstElement();
-					if (first instanceof PullRequest) {
-						onPRSelected((PullRequest) first);
-					}
-				}
-			}
-		};
-		getSite().getWorkbenchWindow().getSelectionService()
-				.addSelectionListener(PullRequestListView.VIEW_ID,
-						prSelectionListener);
+		// prSelectionListener = new ISelectionListener() {
+		// 	@Override
+		// 	public void selectionChanged(IWorkbenchPart part,
+		// 			ISelection selection) {
+		// 		if (selection instanceof IStructuredSelection) {
+		// 			Object first = ((IStructuredSelection) selection)
+		// 					.getFirstElement();
+		// 			if (first instanceof PullRequest) {
+		// 				onPRSelected((PullRequest) first);
+		// 			}
+		// 		}
+		// 	}
+		// };
+		// getSite().getWorkbenchWindow().getSelectionService()
+		// 		.addSelectionListener(PullRequestListView.VIEW_ID,
+		// 				prSelectionListener);
 	}
 
 	private void setupColumns(TreeColumnLayout layout) {
@@ -318,6 +321,18 @@ public class PullRequestChangedFilesView extends ViewPart {
 	}
 
 	private void onPRSelected(PullRequest pr) {
+		loadPullRequest(pr);
+	}
+
+	/**
+	 * Loads a pull request by fetching its changed files and comments. This
+	 * method is public to allow explicit loading from other views (e.g., when
+	 * double-clicking or pressing Enter in PullRequestListView).
+	 *
+	 * @param pr
+	 *            the pull request to load
+	 */
+	public void loadPullRequest(PullRequest pr) {
 		selectedPullRequest = pr;
 
 		// Resolve the Git repository for this PR
@@ -585,11 +600,12 @@ public class PullRequestChangedFilesView extends ViewPart {
 
 	@Override
 	public void dispose() {
-		if (prSelectionListener != null) {
-			getSite().getWorkbenchWindow().getSelectionService()
-					.removeSelectionListener(PullRequestListView.VIEW_ID,
-							prSelectionListener);
-		}
+		// NOTE: prSelectionListener is no longer used (see createPartControl)
+		// if (prSelectionListener != null) {
+		// 	getSite().getWorkbenchWindow().getSelectionService()
+		// 			.removeSelectionListener(PullRequestListView.VIEW_ID,
+		// 					prSelectionListener);
+		// }
 		if (toolkit != null) {
 			toolkit.dispose();
 		}

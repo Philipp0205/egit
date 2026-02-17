@@ -48,12 +48,21 @@ import org.eclipse.jface.viewers.ColumnLabelProvider;
 import org.eclipse.jface.viewers.ColumnWeightData;
 import org.eclipse.jface.viewers.ITreeContentProvider;
 import org.eclipse.jface.viewers.TreeViewer;
+import org.eclipse.jface.viewers.DoubleClickEvent;
+import org.eclipse.jface.viewers.IDoubleClickListener;
+import org.eclipse.jface.viewers.IStructuredSelection;
+import org.eclipse.jface.viewers.StructuredSelection;
 import org.eclipse.jface.viewers.TreeViewerColumn;
 import org.eclipse.swt.SWT;
+import org.eclipse.swt.events.KeyAdapter;
+import org.eclipse.swt.events.KeyEvent;
 import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.IActionBars;
+import org.eclipse.ui.IWorkbenchPage;
+import org.eclipse.ui.IWorkbenchPart;
+import org.eclipse.ui.PartInitException;
 import org.eclipse.ui.dialogs.FilteredTree;
 import org.eclipse.ui.forms.widgets.Form;
 import org.eclipse.ui.forms.widgets.FormToolkit;
@@ -164,6 +173,38 @@ public class PullRequestListView extends ViewPart {
 
 		// Register as selection provider for view communication
 		getSite().setSelectionProvider(pullRequestViewer);
+
+		// Add double-click listener to load PR
+		pullRequestViewer.addDoubleClickListener(new IDoubleClickListener() {
+			@Override
+			public void doubleClick(DoubleClickEvent event) {
+				IStructuredSelection selection = (IStructuredSelection) event
+						.getSelection();
+				if (!selection.isEmpty()) {
+					Object element = selection.getFirstElement();
+					if (element instanceof PullRequest) {
+						loadPullRequest((PullRequest) element);
+					}
+				}
+			}
+		});
+
+		// Load PR on Enter key
+		pullRequestViewer.getTree().addKeyListener(new KeyAdapter() {
+			@Override
+			public void keyPressed(KeyEvent e) {
+				if (e.keyCode == SWT.CR || e.keyCode == SWT.KEYPAD_CR) {
+					IStructuredSelection selection = (IStructuredSelection) pullRequestViewer
+							.getSelection();
+					if (!selection.isEmpty()) {
+						Object element = selection.getFirstElement();
+						if (element instanceof PullRequest) {
+							loadPullRequest((PullRequest) element);
+						}
+					}
+				}
+			}
+		});
 
 		createActions();
 		createFilterActions();
@@ -459,6 +500,29 @@ public class PullRequestListView extends ViewPart {
 	@Override
 	public void setFocus() {
 		pullRequestViewer.getControl().setFocus();
+	}
+
+	/**
+	 * Loads a pull request by opening the PullRequestChangedFilesView and
+	 * triggering it to fetch and display the PR's changed files and comments.
+	 *
+	 * @param pr
+	 *            the pull request to load
+	 */
+	private void loadPullRequest(PullRequest pr) {
+		try {
+			IWorkbenchPage page = getSite().getWorkbenchWindow()
+					.getActivePage();
+			IWorkbenchPart part = page
+					.showView(PullRequestChangedFilesView.VIEW_ID);
+
+			if (part instanceof PullRequestChangedFilesView) {
+				((PullRequestChangedFilesView) part).loadPullRequest(pr);
+			}
+		} catch (PartInitException e) {
+			Activator.logError("Failed to open PullRequestChangedFilesView", //$NON-NLS-1$
+					e);
+		}
 	}
 
 	@Override

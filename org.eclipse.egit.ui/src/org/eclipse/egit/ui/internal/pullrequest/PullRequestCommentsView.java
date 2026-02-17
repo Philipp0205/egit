@@ -31,6 +31,7 @@ import org.eclipse.jface.action.IMenuListener;
 import org.eclipse.jface.action.IMenuManager;
 import org.eclipse.jface.action.MenuManager;
 import org.eclipse.jface.action.Separator;
+import org.eclipse.jface.dialogs.MessageDialog;
 import org.eclipse.jface.layout.GridDataFactory;
 import org.eclipse.jface.layout.GridLayoutFactory;
 import org.eclipse.jface.layout.TreeColumnLayout;
@@ -113,11 +114,17 @@ public class PullRequestCommentsView extends ViewPart {
 
 	private Button replyButton;
 
+	private Button editButton;
+
+	private Button deleteButton;
+
 	private Button taskButton;
 
 	private Button resolveButton;
 
 	private PullRequestComment selectedComment;
+
+	private String currentUsername;
 
 	// Fields for tracking highlighting state
 	private Control lastHighlightedControl;
@@ -237,7 +244,7 @@ public class PullRequestCommentsView extends ViewPart {
 
 		// Button bar
 		Composite buttonBar = toolkit.createComposite(detailComposite);
-		GridLayoutFactory.fillDefaults().numColumns(3).spacing(5, 5)
+		GridLayoutFactory.fillDefaults().numColumns(5).spacing(5, 5)
 				.applyTo(buttonBar);
 		GridDataFactory.fillDefaults().grab(true, false)
 				.applyTo(buttonBar);
@@ -247,6 +254,22 @@ public class PullRequestCommentsView extends ViewPart {
 		replyButton.addListener(SWT.Selection, event -> {
 			if (selectedComment != null) {
 				replyToComment(selectedComment);
+			}
+		});
+
+		editButton = toolkit.createButton(buttonBar, "Edit", SWT.PUSH); //$NON-NLS-1$
+		editButton.setEnabled(false);
+		editButton.addListener(SWT.Selection, event -> {
+			if (selectedComment != null) {
+				editComment(selectedComment);
+			}
+		});
+
+		deleteButton = toolkit.createButton(buttonBar, "Delete", SWT.PUSH); //$NON-NLS-1$
+		deleteButton.setEnabled(false);
+		deleteButton.addListener(SWT.Selection, event -> {
+			if (selectedComment != null) {
+				deleteComment(selectedComment);
 			}
 		});
 
@@ -427,6 +450,25 @@ public class PullRequestCommentsView extends ViewPart {
 			}
 		});
 
+		// Edit and Delete actions - only for own comments
+		boolean isOwner = currentUsername != null
+				&& currentUsername.equals(comment.getAuthorName());
+		if (isOwner) {
+			manager.add(new Action("Edit...") { //$NON-NLS-1$
+				@Override
+				public void run() {
+					editComment(comment);
+				}
+			});
+
+			manager.add(new Action("Delete") { //$NON-NLS-1$
+				@Override
+				public void run() {
+					deleteComment(comment);
+				}
+			});
+		}
+
 		manager.add(new Separator());
 
 		// Create Task action (set severity to BLOCKER)
@@ -514,6 +556,94 @@ public class PullRequestCommentsView extends ViewPart {
 		job.schedule();
 	}
 
+	private void editComment(PullRequestComment comment) {
+		MultiLineInputDialog dialog = new MultiLineInputDialog(
+				getSite().getShell(),
+				"Edit Comment", //$NON-NLS-1$
+				"Edit your comment:", //$NON-NLS-1$
+				comment.getText());
+		if (dialog.open() != Window.OK) {
+			return;
+		}
+
+		String newText = dialog.getValue();
+		if (newText == null || newText.trim().isEmpty()) {
+			return;
+		}
+
+		PullRequest pr = getSelectedPullRequest();
+		if (pr == null) {
+			return;
+		}
+
+		Job job = new Job("Editing comment") { //$NON-NLS-1$
+			@Override
+			protected IStatus run(IProgressMonitor monitor) {
+				try {
+					IPullRequestClient client = createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
+
+					client.editComment(pr.getId(), comment.getId(),
+							comment.getVersion(), newText,
+							comment.isReviewComment());
+
+					// Refresh comments after editing
+					refreshCommentsFromServer(pr);
+					return Status.OK_STATUS;
+				} catch (IOException e) {
+					Activator.logError("Failed to edit comment", e); //$NON-NLS-1$
+					return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+							"Failed to edit comment: " + e.getMessage(), e); //$NON-NLS-1$
+				}
+			}
+		};
+		job.setUser(true);
+		job.schedule();
+	}
+
+	private void deleteComment(PullRequestComment comment) {
+		boolean confirmed = MessageDialog.openConfirm(getSite().getShell(),
+				"Delete Comment", //$NON-NLS-1$
+				"Are you sure you want to delete this comment?"); //$NON-NLS-1$
+		if (!confirmed) {
+			return;
+		}
+
+		PullRequest pr = getSelectedPullRequest();
+		if (pr == null) {
+			return;
+		}
+
+		Job job = new Job("Deleting comment") { //$NON-NLS-1$
+			@Override
+			protected IStatus run(IProgressMonitor monitor) {
+				try {
+					IPullRequestClient client = createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
+
+					client.deleteComment(pr.getId(), comment.getId(),
+							comment.getVersion(), comment.isReviewComment());
+
+					// Refresh comments after deleting
+					refreshCommentsFromServer(pr);
+					return Status.OK_STATUS;
+				} catch (IOException e) {
+					Activator.logError("Failed to delete comment", e); //$NON-NLS-1$
+					return new Status(IStatus.ERROR, Activator.PLUGIN_ID,
+							"Failed to delete comment: " + e.getMessage(), e); //$NON-NLS-1$
+				}
+			}
+		};
+		job.setUser(true);
+		job.schedule();
+	}
+
 	private void updateSeverity(PullRequestComment comment, String severity) {
 		PullRequest pr = getSelectedPullRequest();
 		if (pr == null) {
@@ -589,6 +719,9 @@ public class PullRequestCommentsView extends ViewPart {
 
 			List<PullRequestComment> freshComments = client.getPullRequestComments(pr.getId());
 
+			// Fetch current username if not already cached
+			ensureCurrentUsernameFetched();
+
 			Display.getDefault().asyncExec(() -> {
 				if (!commentsViewer.getControl().isDisposed()) {
 					allComments.clear();
@@ -598,6 +731,26 @@ public class PullRequestCommentsView extends ViewPart {
 			});
 		} catch (IOException e) {
 			Activator.logError("Failed to refresh comments", e); //$NON-NLS-1$
+		}
+	}
+
+	/**
+	 * Ensures the current username is fetched and cached. This method can be
+	 * called from any context where the username is needed.
+	 */
+	private void ensureCurrentUsernameFetched() {
+		if (currentUsername == null) {
+			try {
+				IPullRequestClient client = createClient();
+				if (client != null) {
+					currentUsername = client.getCurrentUser();
+					System.out.println(
+							"Fetched current username: " + currentUsername); //$NON-NLS-1$
+				}
+			} catch (IOException e) {
+				Activator.logError("Failed to get current user", e); //$NON-NLS-1$
+				// Not critical, just means Edit/Delete won't be available
+			}
 		}
 	}
 
@@ -619,6 +772,8 @@ public class PullRequestCommentsView extends ViewPart {
 		if (comments != null) {
 			allComments.addAll(comments);
 		}
+		// Fetch current username if not already cached
+		ensureCurrentUsernameFetched();
 		refreshComments();
 	}
 
@@ -1010,6 +1165,8 @@ public class PullRequestCommentsView extends ViewPart {
 	private void updateButtonStates(PullRequestComment comment) {
 		if (comment == null) {
 			replyButton.setEnabled(false);
+			editButton.setEnabled(false);
+			deleteButton.setEnabled(false);
 			taskButton.setEnabled(false);
 			resolveButton.setEnabled(false);
 			return;
@@ -1017,6 +1174,21 @@ public class PullRequestCommentsView extends ViewPart {
 
 		// Reply button always enabled for any comment
 		replyButton.setEnabled(true);
+
+		// Edit and Delete buttons - only enabled if user owns the comment
+		boolean isOwner = currentUsername != null
+				&& currentUsername.equals(comment.getAuthorName());
+
+		// Debug logging to help diagnose ownership issues
+		if (currentUsername != null && comment.getAuthorName() != null) {
+			System.out.println(
+					"[PullRequestCommentsView] Button state debug: currentUsername='" //$NON-NLS-1$
+					+ currentUsername + "', authorName='" //$NON-NLS-1$
+					+ comment.getAuthorName() + "', isOwner=" + isOwner); //$NON-NLS-1$
+		}
+
+		editButton.setEnabled(isOwner);
+		deleteButton.setEnabled(isOwner);
 
 		// Task button - can toggle between NORMAL and BLOCKER
 		String severity = comment.getSeverity();
@@ -1048,6 +1220,8 @@ public class PullRequestCommentsView extends ViewPart {
 		// When a new PR is selected, clear file selection and reset
 		selectedFile = null;
 		allComments.clear();
+		// Fetch current username early so it's available for button states
+		ensureCurrentUsernameFetched();
 		refreshComments();
 	}
 
@@ -1061,6 +1235,9 @@ public class PullRequestCommentsView extends ViewPart {
 			PullRequestChangedFilesView filesView = (PullRequestChangedFilesView) part;
 			allComments = filesView.getAllComments();
 		}
+
+		// Fetch current username if not already cached
+		ensureCurrentUsernameFetched();
 
 		refreshComments();
 	}
@@ -1097,9 +1274,31 @@ public class PullRequestCommentsView extends ViewPart {
 
 		Display.getDefault().asyncExec(() -> {
 			if (!commentsViewer.getControl().isDisposed()) {
+				// Preserve current selection
+				IStructuredSelection currentSelection = (IStructuredSelection) commentsViewer
+						.getSelection();
+				PullRequestComment selectedComment = null;
+				if (!currentSelection.isEmpty()
+						&& currentSelection.getFirstElement() instanceof PullRequestComment) {
+					selectedComment = (PullRequestComment) currentSelection
+							.getFirstElement();
+				}
+
 				commentsViewer.setInput(displayComments);
 				commentsViewer.refresh();
 				updateFormTitle(displayComments.size());
+
+				// Restore selection if the comment still exists
+				if (selectedComment != null) {
+					final PullRequestComment commentToSelect = findCommentById(
+							displayComments, selectedComment.getId());
+					if (commentToSelect != null) {
+						commentsViewer.setSelection(
+								new org.eclipse.jface.viewers.StructuredSelection(
+										commentToSelect),
+								true);
+					}
+				}
 			}
 		});
 	}
@@ -1255,20 +1454,12 @@ public class PullRequestCommentsView extends ViewPart {
 										&& commentPath.equals(srcPath));
 
 						if (pathMatches) {
-							System.out.println(
-									"[HighlightComment] Found matching editor for path: " //$NON-NLS-1$
-											+ commentPath);
 							// Get the editor part - use true to restore it if
 							// needed
 							IEditorPart editor = ref.getEditor(true);
 							if (editor == null) {
-								System.out.println(
-										"[HighlightComment] Editor is null, skipping"); //$NON-NLS-1$
 								continue;
 							}
-
-							System.out.println(
-									"[HighlightComment] Editor: " + editor); //$NON-NLS-1$
 
 							// Get the control directly from the editor
 							Control viewerControl = findEditorControl(editor,
@@ -1276,16 +1467,10 @@ public class PullRequestCommentsView extends ViewPart {
 
 							if (viewerControl != null
 									&& !viewerControl.isDisposed()) {
-								System.out.println(
-										"[HighlightComment] Found control: " //$NON-NLS-1$
-												+ viewerControl);
 								// Traverse widget tree to find StyledText
 								// controls
 								highlightLineInControl(viewerControl, comment);
 								return; // Found and highlighted
-							} else {
-								System.out.println(
-										"[HighlightComment] No valid control found"); //$NON-NLS-1$
 							}
 						}
 					}
@@ -1537,6 +1722,34 @@ public class PullRequestCommentsView extends ViewPart {
 			count += countAllReplies(reply);
 		}
 		return count;
+	}
+
+	/**
+	 * Finds a comment by ID in the given list, searching recursively through
+	 * replies
+	 *
+	 * @param comments
+	 *            the list of comments to search
+	 * @param commentId
+	 *            the ID of the comment to find
+	 * @return the comment with the matching ID, or {@code null} if not found
+	 */
+	private PullRequestComment findCommentById(
+			List<PullRequestComment> comments, long commentId) {
+		for (PullRequestComment comment : comments) {
+			if (comment.getId() == commentId) {
+				return comment;
+			}
+			// Search in replies recursively
+			List<PullRequestComment> replies = comment.getReplies();
+			if (replies != null && !replies.isEmpty()) {
+				PullRequestComment found = findCommentById(replies, commentId);
+				if (found != null) {
+					return found;
+				}
+			}
+		}
+		return null;
 	}
 
 	/**

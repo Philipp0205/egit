@@ -77,6 +77,8 @@ import org.eclipse.swt.custom.SashForm;
 import org.eclipse.swt.dnd.Clipboard;
 import org.eclipse.swt.dnd.TextTransfer;
 import org.eclipse.swt.dnd.Transfer;
+import org.eclipse.swt.events.KeyAdapter;
+import org.eclipse.swt.events.KeyEvent;
 import org.eclipse.swt.graphics.Color;
 import org.eclipse.swt.graphics.Image;
 import org.eclipse.swt.graphics.RGB;
@@ -347,6 +349,23 @@ public class PullRequestsView extends ViewPart {
 					Object element = selection.getFirstElement();
 					if (element instanceof PullRequest) {
 						onPullRequestDoubleClick((PullRequest) element);
+					}
+				}
+			}
+		});
+
+		// Open PR on Enter key
+		pullRequestViewer.getTree().addKeyListener(new KeyAdapter() {
+			@Override
+			public void keyPressed(KeyEvent e) {
+				if (e.keyCode == SWT.CR || e.keyCode == SWT.KEYPAD_CR) {
+					IStructuredSelection selection = (IStructuredSelection) pullRequestViewer
+							.getSelection();
+					if (!selection.isEmpty()) {
+						Object element = selection.getFirstElement();
+						if (element instanceof PullRequest) {
+							onPullRequestDoubleClick((PullRequest) element);
+						}
 					}
 				}
 			}
@@ -902,6 +921,23 @@ private void onPullRequestDoubleClick(PullRequest pr) {
 					Object element = selection.getFirstElement();
 					if (element instanceof PullRequest) {
 						onPullRequestDoubleClick((PullRequest) element);
+					}
+				}
+			}
+		});
+
+		// Open PR on Enter key
+		pullRequestViewer.getTree().addKeyListener(new KeyAdapter() {
+			@Override
+			public void keyPressed(KeyEvent e) {
+				if (e.keyCode == SWT.CR || e.keyCode == SWT.KEYPAD_CR) {
+					IStructuredSelection selection = (IStructuredSelection) pullRequestViewer
+							.getSelection();
+					if (!selection.isEmpty()) {
+						Object element = selection.getFirstElement();
+						if (element instanceof PullRequest) {
+							onPullRequestDoubleClick((PullRequest) element);
+						}
 					}
 				}
 			}

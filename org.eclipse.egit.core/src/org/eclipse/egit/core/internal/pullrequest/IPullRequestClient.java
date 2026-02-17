@@ -196,6 +196,47 @@ public interface IPullRequestClient {
 			int version, @NonNull String state) throws IOException;
 
 	/**
+	 * Edits an existing comment's text
+	 *
+	 * @param pullRequestId
+	 *            the pull request ID or number
+	 * @param commentId
+	 *            the comment ID
+	 * @param version
+	 *            the comment version (for optimistic locking)
+	 * @param newText
+	 *            the new comment text
+	 * @param isReviewComment
+	 *            true if this is a review comment (inline), false for general
+	 *            comments
+	 * @return the updated comment
+	 * @throws IOException
+	 *             if the request fails
+	 */
+	@NonNull
+	PullRequestComment editComment(long pullRequestId, long commentId,
+			int version, @NonNull String newText, boolean isReviewComment)
+			throws IOException;
+
+	/**
+	 * Deletes a comment
+	 *
+	 * @param pullRequestId
+	 *            the pull request ID or number
+	 * @param commentId
+	 *            the comment ID
+	 * @param version
+	 *            the comment version (for optimistic locking)
+	 * @param isReviewComment
+	 *            true if this is a review comment (inline), false for general
+	 *            comments
+	 * @throws IOException
+	 *             if the request fails
+	 */
+	void deleteComment(long pullRequestId, long commentId, int version,
+			boolean isReviewComment) throws IOException;
+
+	/**
 	 * Tests the connection to the provider
 	 *
 	 * @return true if the connection is successful

@@ -60,6 +60,13 @@ public class PullRequestComment {
 	private long inReplyToId = -1;
 
 	/**
+	 * Whether this is a review comment (inline/code comment) or an issue
+	 * comment (general PR comment). Used by GitHub to determine which API
+	 * endpoint to use for editing/deleting.
+	 */
+	private boolean reviewComment;
+
+	/**
 	 * @return the comment ID
 	 */
 	public long getId() {
@@ -334,5 +341,23 @@ public class PullRequestComment {
 	 */
 	public boolean isInlineComment() {
 		return path != null && line != null;
+	}
+
+	/**
+	 * @return true if this is a review comment (inline/code comment), false if
+	 *         it's an issue comment (general PR comment). Used by GitHub to
+	 *         determine API endpoint.
+	 */
+	public boolean isReviewComment() {
+		return reviewComment;
+	}
+
+	/**
+	 * @param reviewComment
+	 *            true if this is a review comment, false if it's an issue
+	 *            comment
+	 */
+	public void setReviewComment(boolean reviewComment) {
+		this.reviewComment = reviewComment;
 	}
 }

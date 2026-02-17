@@ -25,10 +25,11 @@ import org.eclipse.egit.core.internal.bitbucket.PullRequestComment;
 import org.eclipse.egit.core.internal.pullrequest.IPullRequestClient;
 import org.eclipse.egit.core.internal.pullrequest.PullRequestClientFactory;
 import org.eclipse.egit.ui.Activator;
-import org.eclipse.jface.text.IDocument;
 import org.eclipse.jface.text.source.SourceViewer;
 import org.eclipse.jface.window.Window;
+import org.eclipse.swt.SWT;
 import org.eclipse.swt.custom.StyledText;
+import org.eclipse.swt.graphics.Point;
 import org.eclipse.swt.widgets.Composite;
 import org.eclipse.swt.widgets.Display;
 import org.eclipse.ui.IViewPart;
@@ -37,20 +38,26 @@ import org.eclipse.ui.PlatformUI;
 
 /**
  * Custom {@link TextMergeViewer} subclass that supports displaying inline pull
- * request comments as visual bubbles above commented lines.
+ * request comments using expandable markers in the vertical ruler.
  *
  * <p>
- * This viewer uses {@link InlineCommentPainter} to draw comment bubbles
- * directly on the {@link StyledText} widget via
- * {@link StyledText#setLineVerticalIndent(int, int)} and a paint listener. This
- * approach bypasses Eclipse's annotation framework, making it compatible with
- * {@link TextMergeViewer}'s document lifecycle management.
+ * This viewer uses {@link CommentRulerColumn} to show lightweight speech-bubble
+ * icons in the gutter for lines with comments, and a "+" icon on hover for
+ * adding new comments. Clicking a comment icon expands the full thread inline
+ * using an {@link ExpandedCommentComposite} positioned over the
+ * {@link StyledText} widget via
+ * {@link StyledText#setLineVerticalIndent(int, int)}.
  * </p>
  *
  * <p>
- * Each comment bubble is clickable. Clicking anywhere on a bubble opens the
- * {@link PullRequestCommentsView} and selects that comment, allowing users to
- * view the full thread and reply from there.
+ * Only one comment thread can be expanded at a time per viewer side. Expanding
+ * a different comment automatically collapses the previous one.
+ * </p>
+ *
+ * <p>
+ * Each expanded comment shows the full thread with Reply, Resolve, and
+ * Collapse actions. Clicking on the comment body opens the
+ * {@link PullRequestCommentsView} and selects that comment.
  * </p>
  */
 public class InlineCommentTextMergeViewer extends TextMergeViewer {
@@ -59,13 +66,13 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 
 	private SourceViewer rightSourceViewer;
 
-	private InlineCommentPainter leftPainter;
+	private CommentRulerColumn leftRulerColumn;
 
-	private InlineCommentPainter rightPainter;
+	private CommentRulerColumn rightRulerColumn;
 
-	private AddCommentMarginPainter leftMarginPainter;
+	private ExpandedCommentComposite leftExpandedComposite;
 
-	private AddCommentMarginPainter rightMarginPainter;
+	private ExpandedCommentComposite rightExpandedComposite;
 
 	/**
 	 * Counter for configureTextViewer calls. The call order is always ancestor
@@ -231,21 +238,26 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 	}
 
 	/**
-	 * Actually applies comments to the viewers. This is called either
-	 * immediately from setComments() if documents are ready, or deferred
-	 * until updateContent() is called.
+	 * Actually applies comments to the viewers. Installs
+	 * {@link CommentRulerColumn} instances on both sides and sets the
+	 * comment data on each.
 	 *
 	 * @param comments
 	 *            the list of comments to apply
 	 */
 	private void applyComments(List<PullRequestComment> comments) {
-		clearPainters();
-		clearMarginPainters();
-
-		// Always install margin painters so users can add the first comment
-		installMarginPainters();
+		// Collapse any expanded comment
+		collapseExpanded(leftSourceViewer, true);
+		collapseExpanded(rightSourceViewer, false);
 
 		if (comments == null || comments.isEmpty()) {
+			// Clear ruler columns
+			if (leftRulerColumn != null) {
+				leftRulerColumn.setComments(null);
+			}
+			if (rightRulerColumn != null) {
+				rightRulerColumn.setComments(null);
+			}
 			return;
 		}
 
@@ -273,67 +285,293 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 			}
 		}
 
-		// Handler to select comment in PullRequestCommentsView when clicked
-		InlineCommentPainter.CommentSelectHandler handler = comment -> {
-			try {
-				IWorkbenchPage page = PlatformUI.getWorkbench()
-						.getActiveWorkbenchWindow().getActivePage();
-				if (page == null) {
-					return;
-				}
+		// Install ruler columns if not already present
+		installRulerColumn(leftSourceViewer, true);
+		installRulerColumn(rightSourceViewer, false);
 
-				// Open/activate the PullRequestCommentsView
-				IViewPart part = page.showView(PullRequestCommentsView.VIEW_ID);
-				if (part instanceof PullRequestCommentsView) {
-					// Select the clicked comment in the view
-					((PullRequestCommentsView) part)
-							.selectAndRevealComment(comment);
-				}
-			} catch (Exception e) {
-				Activator.logError(
-						"Failed to open comments view", e); //$NON-NLS-1$
-			}
-		};
-
-		// Install painters for left and right sides
-		if (leftSourceViewer != null && !leftComments.isEmpty()) {
-			IDocument doc = leftSourceViewer.getDocument();
-			StyledText styledText = leftSourceViewer.getTextWidget();
-			if (doc != null && styledText != null
-					&& !styledText.isDisposed()) {
-				leftPainter = new InlineCommentPainter(styledText, doc,
-						leftComments, handler);
-				leftPainter.install();
-			}
+		// Set comments on ruler columns
+		if (leftRulerColumn != null) {
+			leftRulerColumn.setComments(leftComments);
 		}
-
-		if (rightSourceViewer != null && !rightComments.isEmpty()) {
-			IDocument doc = rightSourceViewer.getDocument();
-			StyledText styledText = rightSourceViewer.getTextWidget();
-			if (doc != null && styledText != null
-					&& !styledText.isDisposed()) {
-				rightPainter = new InlineCommentPainter(styledText, doc,
-						rightComments, handler);
-				rightPainter.install();
-			}
+		if (rightRulerColumn != null) {
+			rightRulerColumn.setComments(rightComments);
 		}
 	}
 
-	// ---- Reply handling ----------------------------------------------------
+	/**
+	 * Installs a {@link CommentRulerColumn} on the given source viewer if
+	 * one has not already been installed.
+	 *
+	 * @param viewer
+	 *            the source viewer
+	 * @param isLeft
+	 *            {@code true} for the left side, {@code false} for right
+	 */
+	private void installRulerColumn(SourceViewer viewer, boolean isLeft) {
+		if (viewer == null) {
+			return;
+		}
+
+		CommentRulerColumn existing = isLeft ? leftRulerColumn
+				: rightRulerColumn;
+		if (existing != null) {
+			return;
+		}
+
+		CommentRulerColumn column = new CommentRulerColumn();
+		String fileType = isLeft ? "FROM" : "TO"; //$NON-NLS-1$ //$NON-NLS-2$
+
+		column.setCommentClickHandler((line, lineComments) -> {
+			handleCommentClick(viewer, isLeft, line, lineComments);
+		});
+
+		column.setNewCommentClickHandler(line -> {
+			handleNewComment(line, fileType);
+		});
+
+		viewer.addVerticalRulerColumn(column);
+
+		if (isLeft) {
+			leftRulerColumn = column;
+		} else {
+			rightRulerColumn = column;
+		}
+	}
+
+	// ---- Expand / Collapse ------------------------------------------------
 
 	/**
-	 * Handles a reply action triggered from a comment bubble's Reply link.
-	 * Opens a {@link MultiLineInputDialog}, posts the reply via the
-	 * configured pull request client, then refreshes both the inline
-	 * painters and the {@link PullRequestCommentsView}.
+	 * Handles a click on a comment indicator in the ruler column. Expands
+	 * the comment thread inline, or collapses it if already expanded.
+	 *
+	 * @param viewer
+	 *            the source viewer
+	 * @param isLeft
+	 *            {@code true} for the left side
+	 * @param line
+	 *            the 1-based line number
+	 * @param comments
+	 *            the comments on that line
+	 */
+	private void handleCommentClick(SourceViewer viewer, boolean isLeft,
+			int line, List<PullRequestComment> comments) {
+		CommentRulerColumn column = isLeft ? leftRulerColumn
+				: rightRulerColumn;
+
+		// Toggle: if already expanded on this line, collapse
+		if (column != null && column.getExpandedLine() == line) {
+			collapseExpanded(viewer, isLeft);
+			return;
+		}
+
+		// Collapse any previously expanded comment on this side
+		collapseExpanded(viewer, isLeft);
+
+		// Expand the new comment
+		expandComment(viewer, isLeft, line, comments);
+	}
+
+	/**
+	 * Expands a comment thread inline by creating an
+	 * {@link ExpandedCommentComposite} and reserving space via
+	 * {@link StyledText#setLineVerticalIndent(int, int)}.
+	 *
+	 * @param viewer
+	 *            the source viewer
+	 * @param isLeft
+	 *            {@code true} for the left side
+	 * @param line
+	 *            the 1-based line number
+	 * @param comments
+	 *            the comments on that line
+	 */
+	private void expandComment(SourceViewer viewer, boolean isLeft,
+			int line, List<PullRequestComment> comments) {
+		StyledText styledText = viewer.getTextWidget();
+		if (styledText == null || styledText.isDisposed()) {
+			return;
+		}
+
+		// The comment line (1-based). The indent is set on the line
+		// itself so the composite appears above that line's text.
+		int lineIndex = line;
+		if (lineIndex < 0 || lineIndex >= styledText.getLineCount()) {
+			return;
+		}
+
+		String fileType = isLeft ? "FROM" : "TO"; //$NON-NLS-1$ //$NON-NLS-2$
+
+		ExpandedCommentComposite.CommentActionHandler actionHandler =
+				new ExpandedCommentComposite.CommentActionHandler() {
+
+			@Override
+			public void onReply(PullRequestComment comment) {
+				handleReply(comment, fileType);
+			}
+
+			@Override
+			public void onResolve(PullRequestComment comment) {
+				handleResolve(comment);
+			}
+
+			@Override
+			public void onCollapse(int collapseLine) {
+				collapseExpanded(viewer, isLeft);
+			}
+
+			@Override
+			public void onSelect(PullRequestComment comment) {
+				selectCommentInView(comment);
+			}
+		};
+
+		// Create the expanded composite as a direct child of the
+		// StyledText. Since StyledText extends Canvas (which extends
+		// Composite), it supports child controls, and its internal
+		// scrollVertical() method automatically relocates all children
+		// by the scroll delta. This means the composite scrolls with
+		// the text content without any manual scroll tracking.
+		ExpandedCommentComposite composite =
+				new ExpandedCommentComposite(styledText, SWT.NONE,
+						line, comments, actionHandler);
+
+		// Compute preferred size to determine how much vertical indent
+		// we need
+		Point preferredSize = composite.computeSize(
+				styledText.getClientArea().width - 20, SWT.DEFAULT);
+		int indentHeight = preferredSize.y + 8;
+
+		// Reserve space in the StyledText
+		styledText.setLineVerticalIndent(lineIndex, indentHeight);
+
+		// Position the composite in the reserved indent space
+		positionExpandedComposite(styledText, composite, lineIndex,
+				indentHeight);
+
+		// Reposition on resize so width adapts to editor size changes
+		styledText.addListener(SWT.Resize, e -> {
+			if (!composite.isDisposed()
+					&& !styledText.isDisposed()) {
+				positionExpandedComposite(styledText, composite,
+						lineIndex, indentHeight);
+			}
+		});
+
+		// Update the ruler column to show expanded state
+		CommentRulerColumn column = isLeft ? leftRulerColumn
+				: rightRulerColumn;
+		if (column != null) {
+			column.setExpandedLine(line);
+		}
+
+		// Store reference
+		if (isLeft) {
+			leftExpandedComposite = composite;
+		} else {
+			rightExpandedComposite = composite;
+		}
+	}
+
+	/**
+	 * Positions the {@link ExpandedCommentComposite} in the reserved
+	 * vertical indent area of the {@link StyledText}. Because the
+	 * composite is a direct child of the {@code StyledText}, coordinates
+	 * are in the {@code StyledText}'s local coordinate space and the
+	 * composite scrolls automatically with the text content.
+	 *
+	 * @param styledText
+	 *            the styled text widget
+	 * @param composite
+	 *            the expanded comment composite
+	 * @param lineIndex
+	 *            the 0-based line index (same as 1-based line for this
+	 *            scheme)
+	 * @param indentHeight
+	 *            the reserved indent height
+	 */
+	private void positionExpandedComposite(StyledText styledText,
+			ExpandedCommentComposite composite, int lineIndex,
+			int indentHeight) {
+		if (styledText.isDisposed() || composite.isDisposed()) {
+			return;
+		}
+
+		try {
+			int lineOffset = styledText.getOffsetAtLine(lineIndex);
+			Point location = styledText.getLocationAtOffset(lineOffset);
+			int verticalIndent = styledText
+					.getLineVerticalIndent(lineIndex);
+
+			// Position in StyledText-local coordinates — the indent
+			// area is directly above the line's text baseline.
+			int x = 10;
+			int y = location.y - verticalIndent + 4;
+			int width = styledText.getClientArea().width - 20;
+
+			composite.setBounds(x, y, Math.max(width, 100),
+					indentHeight - 8);
+		} catch (IllegalArgumentException e) {
+			// Line no longer valid
+			composite.setVisible(false);
+		}
+	}
+
+	/**
+	 * Collapses the currently expanded comment on the given side.
+	 *
+	 * @param viewer
+	 *            the source viewer
+	 * @param isLeft
+	 *            {@code true} for the left side
+	 */
+	private void collapseExpanded(SourceViewer viewer, boolean isLeft) {
+		ExpandedCommentComposite composite = isLeft
+				? leftExpandedComposite : rightExpandedComposite;
+		CommentRulerColumn column = isLeft ? leftRulerColumn
+				: rightRulerColumn;
+
+		if (composite != null && !composite.isDisposed()) {
+			int line = composite.getLine();
+			composite.dispose();
+
+			// Reset vertical indent
+			if (viewer != null) {
+				StyledText styledText = viewer.getTextWidget();
+				if (styledText != null && !styledText.isDisposed()) {
+					int lineIndex = line;
+					if (lineIndex >= 0
+							&& lineIndex < styledText.getLineCount()) {
+						styledText.setLineVerticalIndent(lineIndex, 0);
+					}
+				}
+			}
+		}
+
+		if (column != null) {
+			column.setExpandedLine(-1);
+		}
+
+		if (isLeft) {
+			leftExpandedComposite = null;
+		} else {
+			rightExpandedComposite = null;
+		}
+	}
+
+	// ---- Comment actions --------------------------------------------------
+
+	/**
+	 * Handles a reply action from the expanded comment composite.
 	 *
 	 * @param comment
-	 *            the comment being replied to
+	 *            the root comment being replied to
+	 * @param fileType
+	 *            "FROM" for left side, "TO" for right side
 	 */
-	private void handleReply(PullRequestComment comment) {
+	private void handleReply(PullRequestComment comment, String fileType) {
 		MultiLineInputDialog dialog = new MultiLineInputDialog(
 				getControl().getShell(),
-				"Reply to Comment", //$NON-NLS-1$
+				"Reply", //$NON-NLS-1$
 				"Enter your reply:", //$NON-NLS-1$
 				""); //$NON-NLS-1$
 		if (dialog.open() != Window.OK) {
@@ -365,8 +603,6 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 					client.addComment(pr.getId(), replyText,
 							comment.getId());
 
-					// Refresh both the inline comments and the
-					// comments view tree
 					refreshAfterReply(pr, client);
 					return Status.OK_STATUS;
 				} catch (IOException e) {
@@ -385,34 +621,80 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 	}
 
 	/**
-	 * Refreshes both the inline comment painters and the
-	 * {@link PullRequestCommentsView} after a reply has been posted.
+	 * Handles a resolve action from the expanded comment composite.
 	 *
-	 * @param pr
-	 *            the current pull request
-	 * @param client
-	 *            the pull request client
+	 * @param comment
+	 *            the root comment to resolve/reopen
 	 */
-	private void refreshAfterReply(PullRequest pr,
-			IPullRequestClient client) {
-		try {
-			List<PullRequestComment> freshComments =
-					client.getPullRequestComments(pr.getId());
+	private void handleResolve(PullRequestComment comment) {
+		PullRequest pr = getSelectedPullRequest();
+		if (pr == null) {
+			return;
+		}
 
-			Display.getDefault().asyncExec(() -> {
-				if (getControl() != null && !getControl().isDisposed()) {
-					// Refresh inline painters with fresh comments
-					// filtered to the same file
-					List<PullRequestComment> fileComments =
-							filterCommentsForCurrentFile(freshComments);
-					applyComments(fileComments);
+		boolean isResolved = "RESOLVED".equals(comment.getState()); //$NON-NLS-1$
+		String action = isResolved ? "Reopening" : "Resolving"; //$NON-NLS-1$ //$NON-NLS-2$
+
+		Job job = new Job(action + " comment") { //$NON-NLS-1$
+			@Override
+			protected IStatus run(IProgressMonitor monitor) {
+				try {
+					IPullRequestClient client =
+							PullRequestClientFactory.createClient();
+					if (client == null) {
+						return new Status(IStatus.ERROR,
+								Activator.PLUGIN_ID,
+								"Pull request provider not configured"); //$NON-NLS-1$
+					}
+
+					String newState = isResolved
+								? "OPEN" : "RESOLVED"; //$NON-NLS-1$ //$NON-NLS-2$
+					client.updateCommentState(pr.getId(),
+							comment.getId(),
+							comment.getVersion(),
+							newState);
+
+					refreshAfterReply(pr, client);
+					return Status.OK_STATUS;
+				} catch (IOException e) {
+					Activator.logError(
+							"Failed to update comment state", //$NON-NLS-1$
+							e);
+					return new Status(IStatus.ERROR,
+							Activator.PLUGIN_ID,
+							"Failed to update comment: " //$NON-NLS-1$
+									+ e.getMessage(),
+							e);
 				}
+			}
+		};
+		job.setUser(true);
+		job.schedule();
+	}
 
-				// Refresh the PullRequestCommentsView tree
-				refreshCommentsView(freshComments);
-			});
-		} catch (IOException e) {
-			Activator.logError("Failed to refresh comments", e); //$NON-NLS-1$
+	/**
+	 * Selects a comment in the {@link PullRequestCommentsView}.
+	 *
+	 * @param comment
+	 *            the comment to select
+	 */
+	private void selectCommentInView(PullRequestComment comment) {
+		try {
+			IWorkbenchPage page = PlatformUI.getWorkbench()
+					.getActiveWorkbenchWindow().getActivePage();
+			if (page == null) {
+				return;
+			}
+
+			IViewPart part = page
+					.showView(PullRequestCommentsView.VIEW_ID);
+			if (part instanceof PullRequestCommentsView) {
+				((PullRequestCommentsView) part)
+						.selectAndRevealComment(comment);
+			}
+		} catch (Exception e) {
+			Activator.logError(
+					"Failed to open comments view", e); //$NON-NLS-1$
 		}
 	}
 
@@ -420,10 +702,10 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 	 * Handles creating a new inline comment on a specific line.
 	 * Opens a {@link MultiLineInputDialog}, posts the comment via the
 	 * configured pull request client, then refreshes both the inline
-	 * painters and the {@link PullRequestCommentsView}.
+	 * rulers and the {@link PullRequestCommentsView}.
 	 *
 	 * @param line
-	 *            the 0-based line number in the StyledText widget
+	 *            the 1-based line number
 	 * @param fileType
 	 *            "FROM" for left side, "TO" for right side
 	 */
@@ -454,8 +736,6 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 			return;
 		}
 
-		// Convert 0-based StyledText line to 1-based file line
-		final int fileLine = line + 1;
 		final String finalFilePath = currentFilePath;
 
 		Job job = new Job("Posting comment") { //$NON-NLS-1$
@@ -473,14 +753,14 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 					// Get commit SHA from pull request
 					String commitId = pr.getFromRef().getId();
 
-					// Determine line type (simplified - always use ADDED for
-					// now)
-					// TODO: Use RangeDifferencer to determine actual line
-					// type
+					// Determine line type (simplified - always use
+					// ADDED for now)
+					// TODO: Use RangeDifferencer to determine actual
+					// line type
 					String lineType = "ADDED"; //$NON-NLS-1$
 
 					client.addInlineComment(pr.getId(), commentText,
-							finalFilePath, fileLine, lineType, fileType,
+							finalFilePath, line, lineType, fileType,
 							commitId);
 
 					// Refresh both the inline comments and the
@@ -500,6 +780,40 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 		};
 		job.setUser(true);
 		job.schedule();
+	}
+
+	// ---- Refresh ----------------------------------------------------------
+
+	/**
+	 * Refreshes both the inline comment rulers and the
+	 * {@link PullRequestCommentsView} after a reply has been posted.
+	 *
+	 * @param pr
+	 *            the current pull request
+	 * @param client
+	 *            the pull request client
+	 */
+	private void refreshAfterReply(PullRequest pr,
+			IPullRequestClient client) {
+		try {
+			List<PullRequestComment> freshComments =
+					client.getPullRequestComments(pr.getId());
+
+			Display.getDefault().asyncExec(() -> {
+				if (getControl() != null && !getControl().isDisposed()) {
+					// Refresh rulers with fresh comments filtered to
+					// the same file
+					List<PullRequestComment> fileComments =
+							filterCommentsForCurrentFile(freshComments);
+					applyComments(fileComments);
+				}
+
+				// Refresh the PullRequestCommentsView tree
+				refreshCommentsView(freshComments);
+			});
+		} catch (IOException e) {
+			Activator.logError("Failed to refresh comments", e); //$NON-NLS-1$
+		}
 	}
 
 	/**
@@ -539,8 +853,7 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 
 	/**
 	 * Refreshes the {@link PullRequestCommentsView} with fresh comments
-	 * from the server. Uses the same view-finding pattern as
-	 * {@link PullRequestCommentsView} itself.
+	 * from the server.
 	 *
 	 * @param freshComments
 	 *            the fresh comments from the server
@@ -593,61 +906,13 @@ public class InlineCommentTextMergeViewer extends TextMergeViewer {
 
 	// ---- Lifecycle ---------------------------------------------------------
 
-	/**
-	 * Installs margin painters for creating new inline comments
-	 */
-	private void installMarginPainters() {
-		if (leftSourceViewer != null) {
-			StyledText styledText = leftSourceViewer.getTextWidget();
-			if (styledText != null && !styledText.isDisposed()) {
-				leftMarginPainter = new AddCommentMarginPainter(styledText,
-						line -> handleNewComment(line, "FROM")); //$NON-NLS-1$
-				leftMarginPainter.install();
-			}
-		}
-
-		if (rightSourceViewer != null) {
-			StyledText styledText = rightSourceViewer.getTextWidget();
-			if (styledText != null && !styledText.isDisposed()) {
-				rightMarginPainter = new AddCommentMarginPainter(styledText,
-						line -> handleNewComment(line, "TO")); //$NON-NLS-1$
-				rightMarginPainter.install();
-			}
-		}
-	}
-
-	/**
-	 * Clears margin painters
-	 */
-	private void clearMarginPainters() {
-		if (leftMarginPainter != null) {
-			leftMarginPainter.uninstall();
-			leftMarginPainter = null;
-		}
-		if (rightMarginPainter != null) {
-			rightMarginPainter.uninstall();
-			rightMarginPainter = null;
-		}
-	}
-
-	/**
-	 * Removes all inline comment painters from both panes.
-	 */
-	private void clearPainters() {
-		if (leftPainter != null) {
-			leftPainter.uninstall();
-			leftPainter = null;
-		}
-		if (rightPainter != null) {
-			rightPainter.uninstall();
-			rightPainter = null;
-		}
-	}
-
 	@Override
 	protected void handleDispose(org.eclipse.swt.events.DisposeEvent event) {
-		clearPainters();
-		clearMarginPainters();
+		collapseExpanded(leftSourceViewer, true);
+		collapseExpanded(rightSourceViewer, false);
+
+		leftRulerColumn = null;
+		rightRulerColumn = null;
 		leftSourceViewer = null;
 		rightSourceViewer = null;
 		currentComments = null;

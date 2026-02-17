@@ -285,6 +285,47 @@ public class GitHubClient implements IPullRequestClient {
 	}
 
 	@Override
+	public @NonNull PullRequestComment editComment(long pullRequestId,
+			long commentId, int version, @NonNull String newText,
+			boolean isReviewComment) throws IOException {
+		// GitHub API for editing comments:
+		// Review comments: PATCH /repos/{owner}/{repo}/pulls/comments/{comment_id}
+		// Issue comments: PATCH /repos/{owner}/{repo}/issues/comments/{comment_id}
+		
+		String path;
+		if (isReviewComment) {
+			path = "/repos/" + owner + "/" + repo + "/pulls/comments/" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+					+ commentId;
+		} else {
+			path = "/repos/" + owner + "/" + repo + "/issues/comments/" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+					+ commentId;
+		}
+
+		String body = "{\"body\":\"" + escapeJson(newText) + "\"}"; //$NON-NLS-1$ //$NON-NLS-2$
+		String json = doPatch(path, body);
+		return GitHubJsonParser.parseSingleComment(json);
+	}
+
+	@Override
+	public void deleteComment(long pullRequestId, long commentId, int version,
+			boolean isReviewComment) throws IOException {
+		// GitHub API for deleting comments:
+		// Review comments: DELETE /repos/{owner}/{repo}/pulls/comments/{comment_id}
+		// Issue comments: DELETE /repos/{owner}/{repo}/issues/comments/{comment_id}
+		
+		String path;
+		if (isReviewComment) {
+			path = "/repos/" + owner + "/" + repo + "/pulls/comments/" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+					+ commentId;
+		} else {
+			path = "/repos/" + owner + "/" + repo + "/issues/comments/" //$NON-NLS-1$ //$NON-NLS-2$ //$NON-NLS-3$
+					+ commentId;
+		}
+
+		doDelete(path);
+	}
+
+	@Override
 	public boolean testConnection() {
 		try {
 			// Try to get the repository info
@@ -448,6 +489,73 @@ public class GitHubClient implements IPullRequestClient {
 	}
 
 	/**
+	 * Performs a PATCH request to the GitHub API
+	 *
+	 * @param path
+	 *            the API path (relative to API base URL)
+	 * @param body
+	 *            the request body (JSON)
+	 * @return the response body as string
+	 * @throws IOException
+	 *             if the request fails
+	 */
+	private String doPatch(String path, String body) throws IOException {
+		HttpURLConnection conn = null;
+		try {
+			conn = createConnection(path, "PATCH"); //$NON-NLS-1$
+			conn.setDoOutput(true);
+
+			// Write request body
+			try (OutputStream os = conn.getOutputStream()) {
+				os.write(body.getBytes(StandardCharsets.UTF_8));
+			}
+
+			int responseCode = conn.getResponseCode();
+			if (responseCode != 200) {
+				String error = readError(conn);
+				throw new IOException(
+						"GitHub API request failed: HTTP " + responseCode //$NON-NLS-1$
+								+ " - " + error); //$NON-NLS-1$
+			}
+
+			return readResponse(conn);
+
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+
+	/**
+	 * Performs a DELETE request to the GitHub API
+	 *
+	 * @param path
+	 *            the API path (relative to API base URL)
+	 * @throws IOException
+	 *             if the request fails
+	 */
+	private void doDelete(String path) throws IOException {
+		HttpURLConnection conn = null;
+		try {
+			conn = createConnection(path, "DELETE"); //$NON-NLS-1$
+
+			int responseCode = conn.getResponseCode();
+			if (responseCode != 204 && responseCode != 200) {
+				String error = readError(conn);
+				throw new IOException(
+						"GitHub API request failed: HTTP " + responseCode //$NON-NLS-1$
+								+ " - " + error); //$NON-NLS-1$
+			}
+
+		} finally {
+			if (conn != null) {
+				conn.disconnect();
+			}
+		}
+	}
+
+	/**
 	 * Creates an HTTP connection to the GitHub API
 	 *
 	 * @param path
@@ -462,7 +570,16 @@ public class GitHubClient implements IPullRequestClient {
 			throws IOException {
 		URL url = new URL(API_BASE_URL + path);
 		HttpURLConnection conn = (HttpURLConnection) url.openConnection();
-		conn.setRequestMethod(method);
+
+		// HttpURLConnection doesn't support PATCH by default in Java
+		// Use POST with X-HTTP-Method-Override header as a workaround
+		boolean usePatchWorkaround = "PATCH".equals(method); //$NON-NLS-1$
+		if (usePatchWorkaround) {
+			conn.setRequestMethod("POST"); //$NON-NLS-1$
+		} else {
+			conn.setRequestMethod(method);
+		}
+
 		conn.setConnectTimeout(DEFAULT_TIMEOUT);
 		conn.setReadTimeout(DEFAULT_TIMEOUT);
 
@@ -471,6 +588,11 @@ public class GitHubClient implements IPullRequestClient {
 		conn.setRequestProperty("Accept", "application/vnd.github+json"); //$NON-NLS-1$ //$NON-NLS-2$
 		conn.setRequestProperty("X-GitHub-Api-Version", "2022-11-28"); //$NON-NLS-1$ //$NON-NLS-2$
 		conn.setRequestProperty("Content-Type", "application/json"); //$NON-NLS-1$ //$NON-NLS-2$
+
+		// Tell GitHub to treat POST as PATCH
+		if (usePatchWorkaround) {
+			conn.setRequestProperty("X-HTTP-Method-Override", "PATCH"); //$NON-NLS-1$ //$NON-NLS-2$
+		}
 
 		return conn;
 	}

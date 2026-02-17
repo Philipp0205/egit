@@ -239,6 +239,36 @@ public class BitbucketClient implements IPullRequestClient {
 	}
 
 	@Override
+	@NonNull
+	public PullRequestComment editComment(long pullRequestId, long commentId,
+			int version, @NonNull String newText, boolean isReviewComment)
+			throws IOException {
+		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
+				+ "/repos/" + repositorySlug //$NON-NLS-1$
+				+ "/pull-requests/" + pullRequestId //$NON-NLS-1$
+				+ "/comments/" + commentId; //$NON-NLS-1$
+
+		String json = "{\"text\": \"" + escapeJson(newText) //$NON-NLS-1$
+				+ "\", \"version\": " //$NON-NLS-1$
+				+ version + "}"; //$NON-NLS-1$
+
+		String jsonResponse = executePut(url, json);
+		return BitbucketJsonParser.parseSingleComment(jsonResponse);
+	}
+
+	@Override
+	public void deleteComment(long pullRequestId, long commentId, int version,
+			boolean isReviewComment) throws IOException {
+		String url = serverUrl + API_BASE_PATH + "/projects/" + projectKey //$NON-NLS-1$
+				+ "/repos/" + repositorySlug //$NON-NLS-1$
+				+ "/pull-requests/" + pullRequestId //$NON-NLS-1$
+				+ "/comments/" + commentId //$NON-NLS-1$
+				+ "?version=" + version; //$NON-NLS-1$
+
+		executeDelete(url);
+	}
+
+	@Override
 	public boolean testConnection() {
 		try {
 			String url = serverUrl + API_BASE_PATH + "/application-properties"; //$NON-NLS-1$
@@ -313,6 +343,45 @@ public class BitbucketClient implements IPullRequestClient {
 	private String executePut(String urlString, String jsonBody)
 			throws IOException {
 		return executeWriteRequest(urlString, jsonBody, "PUT"); //$NON-NLS-1$
+	}
+
+	private void executeDelete(String urlString) throws IOException {
+		URL url = new URL(urlString);
+		HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+
+		try {
+			connection.setRequestMethod("DELETE"); //$NON-NLS-1$
+			connection.setRequestProperty("Accept", "application/json"); //$NON-NLS-1$ //$NON-NLS-2$
+
+			String auth = "Bearer " + token; //$NON-NLS-1$
+			connection.setRequestProperty("Authorization", auth); //$NON-NLS-1$
+
+			connection.setConnectTimeout(DEFAULT_TIMEOUT);
+			connection.setReadTimeout(DEFAULT_TIMEOUT);
+
+			int responseCode = connection.getResponseCode();
+			if (responseCode != HttpURLConnection.HTTP_NO_CONTENT
+					&& responseCode != HttpURLConnection.HTTP_OK) {
+				if (responseCode == HttpURLConnection.HTTP_UNAUTHORIZED) {
+					throw new IOException(
+							"Authentication failed. Check your access token."); //$NON-NLS-1$
+				} else if (responseCode == HttpURLConnection.HTTP_NOT_FOUND) {
+					throw new IOException("Resource not found."); //$NON-NLS-1$
+				} else if (responseCode == HttpURLConnection.HTTP_CONFLICT) {
+					String errorMessage = readResponse(
+							connection.getErrorStream());
+					throw new IOException(
+							"Conflict (version mismatch). " + errorMessage); //$NON-NLS-1$
+				} else {
+					String errorMessage = readResponse(
+							connection.getErrorStream());
+					throw new IOException("Request failed with status " //$NON-NLS-1$
+							+ responseCode + ": " + errorMessage); //$NON-NLS-1$
+				}
+			}
+		} finally {
+			connection.disconnect();
+		}
 	}
 
 	private String executeWriteRequest(String urlString, String jsonBody,
